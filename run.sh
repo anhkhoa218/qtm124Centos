@@ -108,6 +108,62 @@ add_dns_mail_records() {
     fi
 }
 
+# Ham tu dong tim kiem may in va khoi tao May In Ao CUPS
+setup_cups_auto_virtual_printer() {
+    log_step "Kiem tra va cai dat CUPS Print Server..."
+    dnf install -y cups cups-filters cups-client &>/dev/null
+
+    if [ -f /etc/cups/cups-files.conf ]; then
+        sed -i 's/^#*FileDevice .*/FileDevice Yes/' /etc/cups/cups-files.conf
+        grep -q "^FileDevice Yes" /etc/cups/cups-files.conf || echo "FileDevice Yes" >> /etc/cups/cups-files.conf
+    fi
+
+    systemctl enable --now cups &>/dev/null
+    systemctl restart cups
+
+    # 1. Tu dong tim kiem may in hien co
+    log_step "Dang quet danh sach may in hien co tren he thong..."
+    local FOUND_PRINTERS
+    mapfile -t FOUND_PRINTERS < <(lpstat -e 2>/dev/null || true)
+
+    if [ ${#FOUND_PRINTERS[@]} -gt 0 ]; then
+        log_success "Phat hien ${#FOUND_PRINTERS[@]} may in dang co tren he thong:"
+        for p in "${FOUND_PRINTERS[@]}"; do
+            echo "   -> May in: $p"
+        done
+    else
+        log_warn "Chua co may in vat ly/mang nao duoc ket noi vao CUPS."
+    fi
+
+    # 2. Tu dong tao May In Ao neu chua co
+    mkdir -p /var/spool/samba /var/lib/samba/drivers
+    chmod 1777 /var/spool/samba
+    chmod 755 /var/lib/samba/drivers
+    if command -v getenforce &>/dev/null && [ "$(getenforce)" != "Disabled" ]; then
+        chcon -t samba_share_t /var/spool/samba /var/lib/samba/drivers 2>/dev/null || true
+    fi
+
+    if ! lpstat -p "MayInAo_Lab" &>/dev/null; then
+        log_step "Dang tu dong tao May In Ao 'MayInAo_Lab'..."
+        lpadmin -p "MayInAo_Lab" -E -v "file:/var/spool/samba/MayInAo_Lab.prn" -m "raw" -D "May In Ao Lab Network" -L "CentOS 9 Server" 2>/dev/null || \
+        lpadmin -p "MayInAo_Lab" -E -v "file:/dev/null" -m "raw" -D "May In Ao Lab Network" -L "CentOS 9 Server" 2>/dev/null || true
+
+        cupsenable MayInAo_Lab 2>/dev/null || true
+        cupsaccept MayInAo_Lab 2>/dev/null || true
+        log_success "Da tao thanh cong may in ao: MayInAo_Lab (Device: file:/var/spool/samba/MayInAo_Lab.prn)"
+    else
+        log_success "May in ao 'MayInAo_Lab' da san sang hoat dong."
+    fi
+
+    if systemctl is-active --quiet firewalld; then
+        for z in internal public; do
+            firewall-cmd --zone=$z --permanent --add-port=631/tcp &>/dev/null || true
+            firewall-cmd --zone=$z --permanent --add-service=ipp &>/dev/null || true
+        done
+        firewall-cmd --reload &>/dev/null
+    fi
+}
+
 # ==============================================================================
 # 1. TAT SELINUX VINH VIEN
 # ==============================================================================
@@ -818,11 +874,11 @@ module_setup_nfs() {
 }
 
 # ==============================================================================
-# 9. CAU HINH SAMBA FILE SHARING
+# 9. CAU HINH SAMBA FILE SHARING & TU DONG TAO MAY IN AO
 # ==============================================================================
 module_setup_samba() {
     echo -e "\n${BLUE}======================================================${NC}"
-    echo -e "${BLUE}       CAU HINH SAMBA FILE SHARING (CENTOS 9)         ${NC}"
+    echo -e "${BLUE}       CAU HINH SAMBA FILE SHARING & CUPS PRINTER     ${NC}"
     echo -e "${BLUE}======================================================${NC}"
 
     log_step "Cai dat samba, samba-common, samba-client..."
@@ -879,16 +935,25 @@ module_setup_samba() {
     log_step "Nhap mat khau Samba cho user '$SMB_USER':"
     smbpasswd -a "$SMB_USER"
 
+    echo ""
+    read -rp "Ban co muon tich hop May in CUPS va tu dong tim/tao May In Ao khong? (y/n) [y]: " SETUP_CUPS
+    SETUP_CUPS=${SETUP_CUPS:-y}
+
+    local CUPS_GLOBAL_BLOCK=""
+    if [[ "$SETUP_CUPS" =~ ^[Yy]$ ]]; then
+        setup_cups_auto_virtual_printer
+        CUPS_GLOBAL_BLOCK="load printers = yes\n    printing = cups\n    printcap name = cups\n    cups options = raw"
+    else
+        CUPS_GLOBAL_BLOCK="load printers = no\n    printing = bsd"
+    fi
+
     log_step "Ghi file /etc/samba/smb.conf..."
-    cat << 'EOF_SMB_GLOBAL' > /etc/samba/smb.conf
+    cat << EOF_SMB_GLOBAL > /etc/samba/smb.conf
 [global]
     workgroup = SAMBA
     security = user
     passdb backend = tdbsam
-    printing = cups
-    printcap name = cups
-    load printers = yes
-    cups options = raw
+    $CUPS_GLOBAL_BLOCK
 EOF_SMB_GLOBAL
 
     if [ -n "$SMB_INTERFACES_CONF" ]; then
@@ -908,6 +973,27 @@ EOF_SMB_GLOBAL
     directory mask = 0777
 EOF_SMB_SHARE
 
+    if [[ "$SETUP_CUPS" =~ ^[Yy]$ ]]; then
+        cat << 'EOF_SMB_PRINTERS' >> /etc/samba/smb.conf
+
+[printers]
+    comment = All Network Printers
+    path = /var/spool/samba
+    browseable = yes
+    guest ok = yes
+    writable = no
+    printable = yes
+
+[print$]
+    comment = Printer Drivers
+    path = /var/lib/samba/drivers
+    browseable = yes
+    guest ok = yes
+    read only = yes
+    write list = root, @wheel
+EOF_SMB_PRINTERS
+    fi
+
     if systemctl is-active --quiet firewalld; then
         log_step "Mo dich vu Samba tren ca 2 zone Firewalld..."
         for z in internal public; do
@@ -916,10 +1002,10 @@ EOF_SMB_SHARE
         firewall-cmd --reload
     fi
 
-    log_step "Khoi dong smb va nmb..."
+    log_step "Khoi dong lai smb va nmb..."
     systemctl enable --now smb nmb
     systemctl restart smb nmb
-    log_success "Samba File Sharing da hoat dong!"
+    log_success "Samba File Sharing va May In da hoat dong!"
 }
 
 # ==============================================================================
@@ -978,6 +1064,16 @@ module_setup_samba_ad() {
         DNS_BACKEND="BIND9_DLZ"
         DNS_BACKEND_NAME="BIND9 DLZ"
     fi
+
+    local BASE_DN=""
+    IFS='.' read -ra DOMAIN_PARTS <<< "$DOMAIN_NAME"
+    for part in "${DOMAIN_PARTS[@]}"; do
+        if [ -z "$BASE_DN" ]; then
+            BASE_DN="DC=$part"
+        else
+            BASE_DN="$BASE_DN,DC=$part"
+        fi
+    done
 
     log_step "[1/9] Thiet lap Hostname va /etc/hosts..."
     hostnamectl set-hostname "${SERVER_HOSTNAME}.${DOMAIN_NAME}"
@@ -1077,7 +1173,6 @@ EOF_KRB
         fi
     fi
 
-    log_step "Dat mat khau Administrator khong bao gio het han..."
     samba-tool user setexpiry administrator --noexpiry
     log_success "Provisioning Domain Controller thanh cong!"
 
@@ -1172,7 +1267,120 @@ EOF_BIND_AD
     fi
 
     echo -e "nameserver 127.0.0.1\nnameserver ${DNS_FORWARDER}" > /etc/resolv.conf
-    log_success "Samba Active Directory DC da san sang!"
+    log_success "Khoi tao he thong Samba Active Directory co ban hoan tat!"
+
+    # ==========================================================================
+    # MO RONG: TAO OU, USER, SHARE FOLDER VA CUPS PRINTER TRONG AD DC
+    # ==========================================================================
+    echo ""
+    echo -e "${YELLOW}==================================================================${NC}"
+    echo -e "${YELLOW}       CAU HINH MO RONG CHO ACTIVE DIRECTORY (OU, USER, SHARE)     ${NC}"
+    echo -e "${YELLOW}==================================================================${NC}"
+
+    # 1. Tao OU va User
+    read -rp "Ban co muon tao OU va User truc thuoc OU khong? (y/n) [y]: " CREATE_OU_PROMPT
+    CREATE_OU_PROMPT=${CREATE_OU_PROMPT:-y}
+    local AD_NEW_USER=""
+    if [[ "$CREATE_OU_PROMPT" =~ ^[Yy]$ ]]; then
+        read -rp "  -> Nhap ten OU muon tao [PhongIT]: " OU_NAME
+        OU_NAME=${OU_NAME:-PhongIT}
+
+        log_step "Dang tao OU '$OU_NAME' ($BASE_DN)..."
+        samba-tool ou create "OU=$OU_NAME,$BASE_DN" -U administrator --password="${ADMIN_PASS}" 2>/dev/null || log_warn "OU da ton tai hoac khong the tao."
+        log_success "Da tao OU: $OU_NAME"
+
+        read -rp "  -> Nhap Username muon tao trong OU $OU_NAME [user1]: " AD_NEW_USER
+        AD_NEW_USER=${AD_NEW_USER:-user1}
+        read -rp "  -> Nhap Password cho $AD_NEW_USER [$ADMIN_PASS]: " AD_NEW_PASS
+        AD_NEW_PASS=${AD_NEW_PASS:-$ADMIN_PASS}
+
+        log_step "Dang tao user '$AD_NEW_USER' trong OU '$OU_NAME'..."
+        samba-tool user create "$AD_NEW_USER" "$AD_NEW_PASS" --userou="OU=$OU_NAME" -U administrator --password="${ADMIN_PASS}" 2>/dev/null || log_warn "User da ton tai."
+        samba-tool user setexpiry "$AD_NEW_USER" --noexpiry 2>/dev/null || true
+        log_success "Da tao thanh cong user: $AD_NEW_USER (OU: $OU_NAME)"
+    fi
+
+    # 2. Tao Shared Folder Public & Private
+    read -rp "Ban co muon tao Shared Folder (Public cho moi nguoi & Private cho OU/Domain)? (y/n) [y]: " CREATE_SHARE_PROMPT
+    CREATE_SHARE_PROMPT=${CREATE_SHARE_PROMPT:-y}
+    if [[ "$CREATE_SHARE_PROMPT" =~ ^[Yy]$ ]]; then
+        log_step "Dang tao cac thu muc chia se tren dia phuong..."
+        local PUBLIC_DIR="/srv/samba/public_share"
+        local PRIVATE_DIR="/srv/samba/private_share"
+
+        mkdir -p "$PUBLIC_DIR" "$PRIVATE_DIR"
+        chmod -R 777 "$PUBLIC_DIR"
+        chmod -R 770 "$PRIVATE_DIR"
+
+        if command -v getenforce &>/dev/null && [ "$(getenforce)" != "Disabled" ]; then
+            chcon -t samba_share_t "$PUBLIC_DIR" "$PRIVATE_DIR" 2>/dev/null || true
+        fi
+
+        local VALID_USERS_LINE="@\"$NETBIOS_NAME\\\\Domain Admins\""
+        if [ -n "$AD_NEW_USER" ]; then
+            VALID_USERS_LINE="$VALID_USERS_LINE, \"$AD_NEW_USER\""
+        fi
+
+        cat << EOF_AD_SHARES >> /etc/samba/smb.conf
+
+[Public_Share]
+    comment = Public Shared Folder For Everyone
+    path = $PUBLIC_DIR
+    read only = no
+    guest ok = yes
+    browseable = yes
+    create mask = 0777
+    directory mask = 0777
+
+[Private_Share]
+    comment = Private Shared Folder For Department
+    path = $PRIVATE_DIR
+    read only = no
+    browseable = yes
+    valid users = $VALID_USERS_LINE
+    create mask = 0770
+    directory mask = 0770
+EOF_AD_SHARES
+        log_success "Da tao share: \\\\$DC_FQDN\\Public_Share va Private_Share"
+    fi
+
+    # 3. May In Mang qua CUPS (Tu dong tim kiem va tao may in ao)
+    read -rp "Ban co muon tich hop May in CUPS va tu dong tim/tao May In Ao len AD DC khong? (y/n) [y]: " CREATE_CUPS_AD
+    CREATE_CUPS_AD=${CREATE_CUPS_AD:-y}
+    if [[ "$CREATE_CUPS_AD" =~ ^[Yy]$ ]]; then
+        setup_cups_auto_virtual_printer
+
+        log_step "Nap co che CUPS vao [global] cua Samba AD DC..."
+        if ! grep -q "printing = cups" /etc/samba/smb.conf; then
+            sed -i '/\[global\]/a \    printing = cups\n    printcap name = cups\n    load printers = yes\n    cups options = raw' /etc/samba/smb.conf
+        fi
+
+        log_step "Xuat ban Share [printers] va [print$] tren Samba AD DC..."
+        if ! grep -q "\[printers\]" /etc/samba/smb.conf; then
+            cat << 'EOF_AD_PRINTERS' >> /etc/samba/smb.conf
+
+[printers]
+    comment = All Network Printers
+    path = /var/spool/samba
+    browseable = yes
+    guest ok = yes
+    writable = no
+    printable = yes
+
+[print$]
+    comment = Printer Drivers
+    path = /var/lib/samba/drivers
+    browseable = yes
+    guest ok = yes
+    read only = yes
+    write list = administrator, @"Domain Admins"
+EOF_AD_PRINTERS
+        fi
+    fi
+
+    log_step "Khoi dong lai Samba AD DC de cap nhat Share & May In..."
+    systemctl restart samba
+    log_success "TOAN BO CAU HINH AD DC, OU, SHARE VA CUPS PRINTER DA HOAN TAT!"
 }
 
 # ==============================================================================
@@ -1352,7 +1560,7 @@ service auth-worker {
 service dict {
 }
 EOF_DOVECOT_LOCAL
-    log_success "Cau hinh Dovecot 10-master.conf chuan cu phap hoan tat."
+    log_success "Cau hinh Dovecot 10-master.conf hoan tat."
 
     log_step "[Buoc 5/7] Thiet lap Maildir skeleton va khoi tao user local..."
     mkdir -p /etc/skel/Maildir/{cur,new,tmp}
@@ -1411,9 +1619,8 @@ EOF_DOVECOT_LOCAL
     systemctl is-active --quiet dovecot && echo -e "  - Dovecot: ${GREEN}RUNNING${NC}" || echo -e "  - Dovecot: ${RED}STOPPED${NC}"
     echo -e "  - Domain:        ${CYAN}$DOMAIN${NC}"
     echo -e "  - Mail Hostname: ${CYAN}$MAIL_FQDN${NC}"
-    echo -e "  - IMAP:          Port 143 (STARTTLS/Plain) | Port 993 (SSL/TLS)"
-    echo -e "  - POP3:          Port 110 (STARTTLS/Plain) | Port 995 (SSL/TLS)"
-    echo -e "  - SMTP:          Port 25 (Internal)       | Port 587 (Submission)"
+    echo -e "  - IMAP/POP3:     Port 143, 110, 993, 995"
+    echo -e "  - SMTP:          Port 25, 587"
     echo -e "  - Client Setup:  Dung Thunderbird ket noi vao $MAIL_FQDN voi cac user vua tao."
     echo -e "${GREEN}================================================================${NC}"
 }
@@ -1458,12 +1665,11 @@ module_setup_webmail_enterprise() {
     read -rp "6. Email admin he thong [admin@$DOMAIN]: " ADMIN_EMAIL
     ADMIN_EMAIL=${ADMIN_EMAIL:-admin@$DOMAIN}
 
-    # Ma hoa ky tu @ thanh %40 cho chuoi ket noi MySQL DSN cua Roundcube
     local DB_COMMON_PASS_URL
     DB_COMMON_PASS_URL=$(echo -n "$DB_COMMON_PASS" | sed 's/@/%40/g')
 
     echo ""
-    log_step "[Buoc 1/11] Kich hoat Module PHP 8.3 goc AppStream CentOS 9 (khong can Remi)..."
+    log_step "[Buoc 1/11] Kich hoat Module PHP 8.3 goc AppStream CentOS 9..."
     dnf module reset php -y
     dnf module enable php:8.3 -y
     log_success "PHP 8.3 AppStream da duoc kich hoat."
@@ -1579,7 +1785,7 @@ EOF_SQL_ALIASES
     postconf -e "mydestination = \$myhostname, localhost.\$mydomain, localhost"
     postconf -e "mynetworks = 127.0.0.0/8, $TRUSTED_NET"
     postconf -e "virtual_mailbox_domains = mysql:/etc/postfix/sql/mysql_virtual_domains.cf"
-    postconf -e "virtual_mailbox_maps = mysql:/etc/postfix/sql/mysql_virtual_mailboxes.cf"
+    postconf -e "virtual_mailbox_maps = mysql:/etc/postfix/sql/mysql_virtual_boxes.cf"
     postconf -e "virtual_alias_maps = mysql:/etc/postfix/sql/mysql_virtual_aliases.cf"
     postconf -e "virtual_mailbox_base = /var/vmail"
     postconf -e "virtual_minimum_uid = 5000"
@@ -1617,7 +1823,7 @@ EOF_DOVECOT_SQL
     sed -i 's/^#\?listen =.*/listen = *, ::/' /etc/dovecot/dovecot.conf
 
     sed -i 's|^#\?mail_location =.*|mail_location = maildir:/var/vmail/%d/%n|' /etc/dovecot/conf.d/10-mail.conf
-    sed -i 's/^#\?first_valid_uid =.*/first_valid_uid = 5000/' /etc/dovecot/conf.d/10-mail.conf
+    sed -i 's/^#first_valid_uid =.*/first_valid_uid = 5000/' /etc/dovecot/conf.d/10-mail.conf
 
     sed -i 's/^!include auth-system.conf.ext/#!include auth-system.conf.ext/' /etc/dovecot/conf.d/10-auth.conf
     sed -i 's/^#!include auth-sql.conf.ext/!include auth-sql.conf.ext/' /etc/dovecot/conf.d/10-auth.conf
@@ -1786,7 +1992,6 @@ EOF_NGINX_MAIL
     systemctl enable --now mariadb php-fpm nginx postfix dovecot
     systemctl restart mariadb php-fpm nginx postfix dovecot
 
-    # Dong bo ban ghi DNS
     add_dns_mail_records "$DOMAIN" "$MAIL_FQDN" "$TOPOLOGY_LAN_IP"
 
     echo ""
@@ -1823,8 +2028,8 @@ while true; do
     echo -e "  ${YELLOW}6)${NC} Cau hinh FTP (vsftpd Server)"
     echo -e "  ${YELLOW}7)${NC} Cau hinh Web Server (Nginx & OpenSSL)"
     echo -e "  ${YELLOW}8)${NC} Cau hinh NFS (Server / Client)"
-    echo -e "  ${YELLOW}9)${NC} Cau hinh Samba (Samba File Sharing)"
-    echo -e "  ${YELLOW}10)${NC} Cau hinh Samba Active Directory (AD DC - Tu dong tao PTR)"
+    echo -e "  ${YELLOW}9)${NC} Cau hinh Samba (Samba File Sharing & CUPS Printer)"
+    echo -e "  ${YELLOW}10)${NC} Cau hinh Samba AD DC (OU, User, Share, CUPS Printer)"
     echo -e "  ${YELLOW}11)${NC} Xoa bo Samba Active Directory (Go bo AD DC)"
     echo -e "  ${YELLOW}12)${NC} Cau hinh Mail Server Local User (Postfix + Dovecot)"
     echo -e "  ${YELLOW}13)${NC} Cau hinh Enterprise Webmail (PHP 8.3 AppStream + Roundcube)"
