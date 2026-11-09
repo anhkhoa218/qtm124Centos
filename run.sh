@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # SCRIPT TONG HOP QUAN TRI HE THONG MANG - CENTOS STREAM 9
+# Domain chuan: nhom5.local | Topology: 192.168.10.0/24
 # ==============================================================================
 
 set -o pipefail
@@ -38,7 +39,32 @@ pause_menu() {
     read -rp "Nhan [Enter] de quay lai Menu chinh..."
 }
 
-# Ham chung: Tinh toan Zone nghich va PTR host prefix theo IP (Class A, B, C)
+# Ham lay thong tin IP va Subnet LAN noi bo
+get_lan_topology_info() {
+    local INT_IFACE
+    INT_IFACE=$(firewall-cmd --zone=internal --list-interfaces 2>/dev/null | awk '{print $1}')
+    if [ -z "$INT_IFACE" ]; then
+        local DEFAULT_ROUTE_DEV
+        DEFAULT_ROUTE_DEV=$(ip route show default 2>/dev/null | awk '{print $5}' | head -n1)
+        mapfile -t ALL_ETH < <(nmcli -t -f DEVICE,TYPE device status | grep ethernet | cut -d: -f1)
+        for eth in "${ALL_ETH[@]}"; do
+            if [[ "$eth" != "$DEFAULT_ROUTE_DEV" ]]; then
+                INT_IFACE="$eth"
+                break
+            fi
+        done
+        INT_IFACE=${INT_IFACE:-$DEFAULT_ROUTE_DEV}
+    fi
+
+    TOPOLOGY_LAN_IFACE="$INT_IFACE"
+    TOPOLOGY_LAN_IP=$(ip -4 addr show dev "$INT_IFACE" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)
+    TOPOLOGY_LAN_IP=${TOPOLOGY_LAN_IP:-192.168.10.1}
+
+    TOPOLOGY_LAN_SUBNET=$(ip route show dev "$INT_IFACE" proto kernel 2>/dev/null | awk '{print $1}' | head -n1)
+    TOPOLOGY_LAN_SUBNET=${TOPOLOGY_LAN_SUBNET:-192.168.10.0/24}
+}
+
+# Ham tu dong tinh Zone nghich va PTR
 calc_reverse_zone_info() {
     local ip="$1"
     local o1 o2 o3 o4
@@ -52,6 +78,33 @@ calc_reverse_zone_info() {
     else
         CALC_REV_ZONE="${o3}.${o2}.${o1}.in-addr.arpa"
         CALC_PTR_PREFIX="${o4}"
+    fi
+}
+
+# Ham tu dong them A record va MX record vao DNS Server
+add_dns_mail_records() {
+    local domain="$1"
+    local mail_fqdn="$2"
+    local server_ip="$3"
+
+    local FWD_FILE="/var/named/${domain}.db"
+    if [ -f "$FWD_FILE" ]; then
+        log_step "Phat hien file Zone BIND ($FWD_FILE). Dang cap nhat ban ghi Mail..."
+        if ! grep -q "mail" "$FWD_FILE"; then
+            echo "mail    IN      A       ${server_ip}" >> "$FWD_FILE"
+        fi
+        if ! grep -q "MX" "$FWD_FILE"; then
+            echo "@       IN      MX  10  ${mail_fqdn}." >> "$FWD_FILE"
+        fi
+        named-checkzone "$domain" "$FWD_FILE" >/dev/null 2>&1 && systemctl restart named 2>/dev/null || true
+        log_success "Da cap nhat ban ghi A va MX vao BIND DNS!"
+    fi
+
+    if systemctl is-active --quiet samba 2>/dev/null && command -v samba-tool &>/dev/null; then
+        log_step "Phat hien Samba AD DC. Dang dong bo DNS qua samba-tool..."
+        samba-tool dns add 127.0.0.1 "$domain" mail A "$server_ip" -U administrator 2>/dev/null || true
+        samba-tool dns add 127.0.0.1 "$domain" "@" MX "${mail_fqdn} 10" -U administrator 2>/dev/null || true
+        log_success "Da cap nhat ban ghi A va MX tren Samba AD DC!"
     fi
 }
 
@@ -69,7 +122,8 @@ module_disable_selinux() {
 
     if [[ "$current_selinux" == "Enforcing" ]]; then
         log_step "SELinux dang Enforcing. Dang ha ve Permissive tam thoi (setenforce 0)..."
-        setenforce 0 && log_success "Da chay setenforce 0 thanh cong."
+        setenforce 0 2>/dev/null || true
+        log_success "Da chay setenforce 0 thanh cong."
     fi
 
     if [[ -f /etc/selinux/config ]]; then
@@ -107,12 +161,7 @@ module_setup_ip() {
         ip_addr=$(nmcli -g IP4.ADDRESS device show "$dev" 2>/dev/null | head -n1)
         gw=$(nmcli -g IP4.GATEWAY device show "$dev" 2>/dev/null)
         dns=$(nmcli -g IP4.DNS device show "$dev" 2>/dev/null | tr '\n' ' ')
-        
-        printf "%-12s %-20s %-18s %-20s\n" \
-            "$dev" \
-            "${ip_addr:-Chua co}" \
-            "${gw:-Chua co}" \
-            "${dns:-Chua co}"
+        printf "%-12s %-20s %-18s %-20s\n" "$dev" "${ip_addr:-Chua co}" "${gw:-Chua co}" "${dns:-Chua co}"
     done
     echo "----------------------------------------------------------------------"
 
@@ -204,7 +253,7 @@ module_setup_ip() {
 
         if [[ "${CFG_MODE[$iface]}" == "dhcp" ]]; then
             nmcli connection add type ethernet con-name "$iface" ifname "$iface" \
-                ipv4.method auto ipv4.dns-priority 100 connection.zone "$zone" connection.autoconnect yes
+                ipv4.method auto ipv4.dns-priority 100 connection.zone "$zone" connection.autoconnect yes >/dev/null
         else
             local args=(
                 type ethernet
@@ -228,11 +277,11 @@ module_setup_ip() {
                 args+=(ipv4.never-default yes ipv4.dns-priority 10)
             fi
 
-            nmcli connection add "${args[@]}"
+            nmcli connection add "${args[@]}" >/dev/null
         fi
 
         log_step "Kich hoat profile '$iface'..."
-        nmcli connection up "$iface"
+        nmcli connection up "$iface" >/dev/null
         log_success "Profile '$iface' da hoat dong."
     }
 
@@ -243,18 +292,18 @@ module_setup_ip() {
 
     if [[ $TOTAL_DEV -eq 1 ]]; then
         tao_connection "$SINGLE_IFACE" "public"
-        firewall-cmd --permanent --zone=public --change-interface="$SINGLE_IFACE"
+        firewall-cmd --permanent --zone=public --change-interface="$SINGLE_IFACE" >/dev/null
     else
         tao_connection "$EXT_IFACE" "external"
         tao_connection "$INT_IFACE" "internal"
         
-        firewall-cmd --permanent --zone=external --change-interface="$EXT_IFACE"
-        firewall-cmd --permanent --zone=internal --change-interface="$INT_IFACE"
+        firewall-cmd --permanent --zone=external --change-interface="$EXT_IFACE" >/dev/null
+        firewall-cmd --permanent --zone=internal --change-interface="$INT_IFACE" >/dev/null
         firewall-cmd --permanent --zone=external --remove-masquerade >/dev/null 2>&1 || true
     fi
 
     log_step "Reload Firewalld de ap dung interface..."
-    firewall-cmd --reload
+    firewall-cmd --reload >/dev/null
     log_success "Cau hinh mang va Firewalld hoan tat!"
     ip -br addr show
 }
@@ -313,7 +362,7 @@ module_setup_nat() {
 }
 
 # ==============================================================================
-# 4. CAU HINH DNS SERVER (BIND9 THUAN - TU DONG TAO ZONE NGHICH & PTR)
+# 4. CAU HINH DNS SERVER (BIND9)
 # ==============================================================================
 module_setup_dns() {
     echo -e "\n${BLUE}======================================================${NC}"
@@ -326,19 +375,22 @@ module_setup_dns() {
     local SERIAL_DATE
     SERIAL_DATE="$(date +%Y%m%d)01"
 
-    read -rp "Nhap ten mien Zone thuan (VD: nhom5.local.vn): " FORWARD_ZONE
-    read -rp "Nhap IP cua DNS Server (VD: 192.168.10.1): " SERVER_IP
+    get_lan_topology_info
+    read -rp "Nhap ten mien Zone thuan [nhom5.local]: " FORWARD_ZONE
+    FORWARD_ZONE=${FORWARD_ZONE:-nhom5.local}
 
-    # Tu dong nhan dien lop mang va tao Zone nghich
+    read -rp "Nhap IP cua DNS Server [$TOPOLOGY_LAN_IP]: " SERVER_IP
+    SERVER_IP=${SERVER_IP:-$TOPOLOGY_LAN_IP}
+
     calc_reverse_zone_info "$SERVER_IP"
     local REVERSE_ZONE="$CALC_REV_ZONE"
     local PTR_PREFIX="$CALC_PTR_PREFIX"
 
-    log_step "Zone thuan: $FORWARD_ZONE | Zone nghich tu dong: $REVERSE_ZONE (PTR prefix: $PTR_PREFIX)"
+    log_step "Zone thuan: $FORWARD_ZONE | Zone nghich: $REVERSE_ZONE (PTR prefix: $PTR_PREFIX)"
 
     log_step "Tao file zone thuan /var/named/${FORWARD_ZONE}.db..."
     local FWD_FILE="/var/named/${FORWARD_ZONE}.db"
-    cat <<EOF > "$FWD_FILE"
+    cat << EOF_FWD > "$FWD_FILE"
 \$TTL 1D
 @       IN SOA  ns1.${FORWARD_ZONE}. admin.${FORWARD_ZONE}. (
                                         ${SERIAL_DATE} ; Serial
@@ -350,11 +402,13 @@ module_setup_dns() {
 ns1     IN      A       ${SERVER_IP}
 @       IN      A       ${SERVER_IP}
 www     IN      A       ${SERVER_IP}
-EOF
+mail    IN      A       ${SERVER_IP}
+@       IN      MX  10  mail.${FORWARD_ZONE}.
+EOF_FWD
 
-    log_step "Tao file zone nghich /var/named/${REVERSE_ZONE}.db voi ban ghi PTR chuan..."
+    log_step "Tao file zone nghich /var/named/${REVERSE_ZONE}.db voi ban ghi PTR..."
     local REV_FILE="/var/named/${REVERSE_ZONE}.db"
-    cat <<EOF > "$REV_FILE"
+    cat << EOF_REV > "$REV_FILE"
 \$TTL 1D
 @       IN SOA  ns1.${FORWARD_ZONE}. admin.${FORWARD_ZONE}. (
                                         ${SERIAL_DATE} ; Serial
@@ -365,15 +419,16 @@ EOF
 @       IN      NS      ns1.${FORWARD_ZONE}.
 ${PTR_PREFIX}       IN      PTR     ns1.${FORWARD_ZONE}.
 ${PTR_PREFIX}       IN      PTR     ${FORWARD_ZONE}.
-EOF
+${PTR_PREFIX}       IN      PTR     mail.${FORWARD_ZONE}.
+EOF_REV
 
     if [ -f /etc/named.conf ] && [ ! -f /etc/named.conf.bak ]; then
         cp -p /etc/named.conf /etc/named.conf.bak
         log_success "Da tao ban sao luu: /etc/named.conf.bak"
     fi
 
-    log_step "Ghi file /etc/named.conf gom ca cap Zone thuan & nghich..."
-    cat <<EOF > /etc/named.conf
+    log_step "Ghi file /etc/named.conf..."
+    cat << EOF_NAMED > /etc/named.conf
 options {
     listen-on port 53 { any; };
     directory       "/var/named";
@@ -402,7 +457,7 @@ zone "${REVERSE_ZONE}" IN {
 
 include "/etc/named.rfc1912.zones";
 include "/etc/named.root.key";
-EOF
+EOF_NAMED
 
     log_step "Phan quyen cho user 'named'..."
     chown root:named /etc/named.conf "$FWD_FILE" "$REV_FILE"
@@ -423,7 +478,7 @@ EOF
         firewall-cmd --add-service=dns --permanent --zone=public
         firewall-cmd --reload
     fi
-    log_success "BIND DNS Server da san sang! PTR da duoc tao cho ${SERVER_IP} -> ns1.${FORWARD_ZONE}."
+    log_success "BIND DNS Server da duoc cau hinh thanh cong cho mien $FORWARD_ZONE!"
 }
 
 # ==============================================================================
@@ -438,15 +493,25 @@ module_setup_dhcp() {
     dnf install -y dhcp-server
     local CONF_PATH="/etc/dhcp/dhcpd.conf"
 
-    read -rp "Dia chi Subnet mang (VD: 192.168.10.0): " SUBNET
-    read -rp "Subnet Mask (VD: 255.255.255.0): " NETMASK
-    read -rp "Dai IP cap - Bat dau (VD: 192.168.10.100): " RANGE_START
-    read -rp "Dai IP cap - Ket thuc (VD: 192.168.10.200): " RANGE_END
-    read -rp "Default Gateway (VD: 192.168.10.1): " GATEWAY
-    read -rp "DNS Servers (VD: 192.168.10.1): " DNS_SERVERS
+    get_lan_topology_info
+    local NET_PREFIX
+    NET_PREFIX=$(echo "$TOPOLOGY_LAN_IP" | cut -d. -f1-3)
+
+    read -rp "Dia chi Subnet mang [$TOPOLOGY_LAN_SUBNET]: " SUBNET
+    SUBNET=${SUBNET:-$TOPOLOGY_LAN_SUBNET}
+    read -rp "Subnet Mask [255.255.255.0]: " NETMASK
+    NETMASK=${NETMASK:-255.255.255.0}
+    read -rp "Dai IP cap - Bat dau [${NET_PREFIX}.100]: " RANGE_START
+    RANGE_START=${RANGE_START:-${NET_PREFIX}.100}
+    read -rp "Dai IP cap - Ket thuc [${NET_PREFIX}.200]: " RANGE_END
+    RANGE_END=${RANGE_END:-${NET_PREFIX}.200}
+    read -rp "Default Gateway [$TOPOLOGY_LAN_IP]: " GATEWAY
+    GATEWAY=${GATEWAY:-$TOPOLOGY_LAN_IP}
+    read -rp "DNS Servers [$TOPOLOGY_LAN_IP]: " DNS_SERVERS
+    DNS_SERVERS=${DNS_SERVERS:-$TOPOLOGY_LAN_IP}
 
     log_step "Ghi file cau hinh $CONF_PATH..."
-    cat <<EOF > "$CONF_PATH"
+    cat << EOF_DHCP > "$CONF_PATH"
 default-lease-time 600;
 max-lease-time 7200;
 authoritative;
@@ -457,7 +522,7 @@ subnet $SUBNET netmask $NETMASK {
     option routers $GATEWAY;
     option domain-name-servers $DNS_SERVERS;
 }
-EOF
+EOF_DHCP
 
     log_step "Kiem tra cu phap dhcpd.conf..."
     dhcpd -t -cf "$CONF_PATH"
@@ -488,7 +553,7 @@ module_setup_ftp() {
     local CONF_FILE="/etc/vsftpd/vsftpd.conf"
 
     log_step "Ghi file cau hinh $CONF_FILE..."
-    cat <<EOF > "$CONF_FILE"
+    cat << 'EOF_FTP' > "$CONF_FILE"
 listen=YES
 listen_ipv6=NO
 listen_port=21
@@ -503,7 +568,7 @@ pasv_min_port=30000
 pasv_max_port=31000
 userlist_enable=NO
 pam_service_name=vsftpd
-EOF
+EOF_FTP
 
     read -rp "Nhap ten user FTP [Mac dinh: ftpuser]: " FTP_USER
     FTP_USER=${FTP_USER:-ftpuser}
@@ -523,11 +588,11 @@ EOF
     fi
 
     if systemctl is-active --quiet firewalld; then
-        log_step "Mo port FTP (21) va Passive ports (30000-31000) tren Firewalld..."
-        firewall-cmd --permanent --zone=internal --add-service=ftp
-        firewall-cmd --permanent --zone=internal --add-port=30000-31000/tcp
-        firewall-cmd --permanent --zone=public --add-service=ftp
-        firewall-cmd --permanent --zone=public --add-port=30000-31000/tcp
+        log_step "Mo port FTP (21) va Passive ports (30000-31000) tren ca 2 zone..."
+        for z in internal public; do
+            firewall-cmd --permanent --zone=$z --add-service=ftp
+            firewall-cmd --permanent --zone=$z --add-port=30000-31000/tcp
+        done
         firewall-cmd --reload
     fi
 
@@ -552,25 +617,26 @@ module_setup_web() {
 
     if systemctl is-active --quiet firewalld; then
         log_step "Mo port HTTP (80) va HTTPS (443) tren Firewalld..."
-        firewall-cmd --zone=internal --add-service=http --permanent
-        firewall-cmd --zone=internal --add-service=https --permanent
-        firewall-cmd --zone=public --add-service=http --permanent
-        firewall-cmd --zone=public --add-service=https --permanent
+        for z in internal public; do
+            firewall-cmd --zone=$z --add-service=http --permanent
+            firewall-cmd --zone=$z --add-service=https --permanent
+        done
         firewall-cmd --reload
     fi
 
-    read -rp "Nhap Domain hoac IP website (VD: nhom5.local.vn): " DOMAIN_IP
+    read -rp "Nhap Domain hoac IP website [nhom5.local]: " DOMAIN_IP
+    DOMAIN_IP=${DOMAIN_IP:-nhom5.local}
     local WEB_ROOT="/var/www/$DOMAIN_IP"
     mkdir -p "$WEB_ROOT"
 
     log_step "Khoi tao file $WEB_ROOT/index.html..."
-    cat <<EOF > "$WEB_ROOT/index.html"
+    cat << EOF_HTML > "$WEB_ROOT/index.html"
 <!DOCTYPE html>
 <html>
 <head><title>Website $DOMAIN_IP</title></head>
 <body><h1>Chao mung den voi website: $DOMAIN_IP</h1></body>
 </html>
-EOF
+EOF_HTML
 
     chown -R nginx:nginx "$WEB_ROOT"
     chmod -R 755 "$WEB_ROOT"
@@ -582,32 +648,33 @@ EOF
     openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
         -keyout "$SSL_KEY" \
         -out "$SSL_CRT" \
-        -subj "/C=VN/ST=HCM/L=HCM/O=Lab/CN=${DOMAIN_IP}"
+        -subj "/C=VN/ST=HCM/L=HCM/O=Lab/CN=${DOMAIN_IP}" 2>/dev/null
 
     local CONF_FILE="/etc/nginx/conf.d/${DOMAIN_IP}.conf"
     log_step "Ghi file VirtualHost $CONF_FILE..."
-    cat <<EOF > "$CONF_FILE"
+    cat << 'EOF_NGINX' > "$CONF_FILE"
 server {
     listen 80;
-    server_name $DOMAIN_IP www.$DOMAIN_IP;
-    return 301 https://\$host\$request_uri;
+    server_name __DOMAIN__ www.__DOMAIN__;
+    return 301 https://$host$request_uri;
 }
 
 server {
     listen 443 ssl;
-    server_name $DOMAIN_IP www.$DOMAIN_IP;
+    server_name __DOMAIN__ www.__DOMAIN__;
 
-    ssl_certificate $SSL_CRT;
-    ssl_certificate_key $SSL_KEY;
+    ssl_certificate /etc/nginx/ssl/__DOMAIN__.crt;
+    ssl_certificate_key /etc/nginx/ssl/__DOMAIN__.key;
 
-    root $WEB_ROOT;
+    root /var/www/__DOMAIN__;
     index index.html;
 
     location / {
-        try_files \$uri \$uri/ =404;
+        try_files $uri $uri/ =404;
     }
 }
-EOF
+EOF_NGINX
+    sed -i "s/__DOMAIN__/$DOMAIN_IP/g" "$CONF_FILE"
 
     log_step "Kiem tra cu phap Nginx va nap lai..."
     nginx -t && systemctl reload nginx
@@ -629,10 +696,7 @@ module_setup_nfs() {
         fi
 
         for i in "${!danh_sach_nic[@]}"; do
-            local nic_name nic_ip
-            nic_name=$(echo "${danh_sach_nic[$i]}" | awk '{print $1}')
-            nic_ip=$(echo "${danh_sach_nic[$i]}" | awk '{print $2}')
-            echo " $((i+1)). Card: $nic_name | IP: $nic_ip"
+            echo " $((i+1)). Card: $(echo "${danh_sach_nic[$i]}" | awk '{print $1}') | IP: $(echo "${danh_sach_nic[$i]}" | awk '{print $2}')"
         done
         echo " $(( ${#danh_sach_nic[@]} + 1 )). Nhap thu cong"
         echo "------------------------------------------"
@@ -687,13 +751,12 @@ module_setup_nfs() {
         systemctl enable --now nfs-server
 
         if systemctl is-active --quiet firewalld; then
-            log_step "Mo port NFS tren Firewalld..."
-            firewall-cmd --permanent --zone=internal --add-service=nfs
-            firewall-cmd --permanent --zone=internal --add-service=rpc-bind
-            firewall-cmd --permanent --zone=internal --add-service=mountd
-            firewall-cmd --permanent --zone=public --add-service=nfs
-            firewall-cmd --permanent --zone=public --add-service=rpc-bind
-            firewall-cmd --permanent --zone=public --add-service=mountd
+            log_step "Mo port NFS tren ca zone internal va public..."
+            for z in internal public; do
+                firewall-cmd --permanent --zone=$z --add-service=nfs
+                firewall-cmd --permanent --zone=$z --add-service=rpc-bind
+                firewall-cmd --permanent --zone=$z --add-service=mountd
+            done
             firewall-cmd --reload
         fi
         log_success "NFS Server san sang tai $SHARE_DIR cho dai mang $CLIENT_NETWORK"
@@ -817,7 +880,7 @@ module_setup_samba() {
     smbpasswd -a "$SMB_USER"
 
     log_step "Ghi file /etc/samba/smb.conf..."
-    cat <<EOF > /etc/samba/smb.conf
+    cat << 'EOF_SMB_GLOBAL' > /etc/samba/smb.conf
 [global]
     workgroup = SAMBA
     security = user
@@ -826,13 +889,13 @@ module_setup_samba() {
     printcap name = cups
     load printers = yes
     cups options = raw
-EOF
+EOF_SMB_GLOBAL
 
     if [ -n "$SMB_INTERFACES_CONF" ]; then
         echo -e "    $SMB_INTERFACES_CONF" >> /etc/samba/smb.conf
     fi
 
-    cat <<EOF >> /etc/samba/smb.conf
+    cat << EOF_SMB_SHARE >> /etc/samba/smb.conf
 
 [$SMB_SHARE_NAME]
     comment = Shared Folder via Samba
@@ -843,12 +906,13 @@ EOF
     writable = yes
     create mask = 0777
     directory mask = 0777
-EOF
+EOF_SMB_SHARE
 
     if systemctl is-active --quiet firewalld; then
-        log_step "Mo dich vu Samba tren Firewalld..."
-        firewall-cmd --permanent --zone=internal --add-service=samba
-        firewall-cmd --permanent --zone=public --add-service=samba
+        log_step "Mo dich vu Samba tren ca 2 zone Firewalld..."
+        for z in internal public; do
+            firewall-cmd --permanent --zone=$z --add-service=samba
+        done
         firewall-cmd --reload
     fi
 
@@ -866,32 +930,11 @@ module_setup_samba_ad() {
     echo -e "${CYAN}    CAU HINH SAMBA ACTIVE DIRECTORY DOMAIN CONTROLLER (AD DC)     ${NC}"
     echo -e "${CYAN}==================================================================${NC}"
 
-    local SUGGESTED_LAN_IFACE=""
-    local SUGGESTED_LAN_IP=""
-    
-    local INTERNAL_IFACE
-    INTERNAL_IFACE=$(firewall-cmd --zone=internal --list-interfaces 2>/dev/null | awk '{print $1}')
-    if [ -n "$INTERNAL_IFACE" ]; then
-        SUGGESTED_LAN_IFACE="$INTERNAL_IFACE"
-    else
-        local DEFAULT_ROUTE_DEV
-        DEFAULT_ROUTE_DEV=$(ip route show default 2>/dev/null | awk '{print $5}' | head -n1)
-        mapfile -t ALL_ETH < <(nmcli -t -f DEVICE,TYPE device status | grep ethernet | cut -d: -f1)
-        for eth in "${ALL_ETH[@]}"; do
-            if [[ "$eth" != "$DEFAULT_ROUTE_DEV" ]]; then
-                SUGGESTED_LAN_IFACE="$eth"
-                break
-            fi
-        done
-        SUGGESTED_LAN_IFACE=${SUGGESTED_LAN_IFACE:-$DEFAULT_ROUTE_DEV}
-    fi
-
-    SUGGESTED_LAN_IP=$(ip -4 addr show dev "$SUGGESTED_LAN_IFACE" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)
-    SUGGESTED_LAN_IP=${SUGGESTED_LAN_IP:-192.168.10.1}
+    get_lan_topology_info
 
     echo -e "${YELLOW}Vui long nhap thong tin thiet lap Samba AD DC:${NC}"
-    read -rp "1. Ten mien Domain FQDN (VD: nhom5.local hoac tien.lo) [tien.lo]: " DOMAIN_NAME
-    DOMAIN_NAME="${DOMAIN_NAME:-tien.lo}"
+    read -rp "1. Ten mien Domain FQDN [nhom5.local]: " DOMAIN_NAME
+    DOMAIN_NAME="${DOMAIN_NAME:-nhom5.local}"
 
     local REALM_DEFAULT
     REALM_DEFAULT=$(echo "$DOMAIN_NAME" | tr '[:lower:]' '[:upper:]')
@@ -906,12 +949,12 @@ module_setup_samba_ad() {
     read -rp "4. Hostname may chu DC [srvads]: " SERVER_HOSTNAME
     SERVER_HOSTNAME="${SERVER_HOSTNAME:-srvads}"
 
-    echo -e "${CYAN}[*] Luu y: Card DC phai la card LAN noi bo (VD: $SUGGESTED_LAN_IFACE). Tuyet doi khong chon card WAN!${NC}"
-    read -rp "5. Card mang LAN cho DC [$SUGGESTED_LAN_IFACE]: " INTERFACE
-    INTERFACE="${INTERFACE:-$SUGGESTED_LAN_IFACE}"
+    echo -e "${CYAN}[*] Luu y: Card DC phai la card LAN noi bo (VD: $TOPOLOGY_LAN_IFACE). Tuyet doi khong chon card WAN!${NC}"
+    read -rp "5. Card mang LAN cho DC [$TOPOLOGY_LAN_IFACE]: " INTERFACE
+    INTERFACE="${INTERFACE:-$TOPOLOGY_LAN_IFACE}"
 
-    read -rp "6. Dia chi IP DC [$SUGGESTED_LAN_IP]: " STATIC_IP
-    STATIC_IP="${STATIC_IP:-$SUGGESTED_LAN_IP}"
+    read -rp "6. Dia chi IP DC [$TOPOLOGY_LAN_IP]: " STATIC_IP
+    STATIC_IP="${STATIC_IP:-$TOPOLOGY_LAN_IP}"
 
     read -rp "7. Subnet Mask Prefix (CIDR) [24]: " NETMASK
     NETMASK="${NETMASK:-24}"
@@ -919,8 +962,8 @@ module_setup_samba_ad() {
     read -rp "8. DNS Forwarder ra Internet [8.8.8.8]: " DNS_FORWARDER
     DNS_FORWARDER="${DNS_FORWARDER:-8.8.8.8}"
 
-    read -rp "9. Mat khau Administrator AD [Admin@TienLo2026!]: " ADMIN_PASS
-    ADMIN_PASS="${ADMIN_PASS:-Admin@TienLo2026!}"
+    read -rp "9. Mat khau Administrator AD [Admin@Nhom52026!]: " ADMIN_PASS
+    ADMIN_PASS="${ADMIN_PASS:-Admin@Nhom52026!}"
 
     echo ""
     echo -e "${YELLOW}Chon DNS Backend cho AD DC:${NC}"
@@ -936,35 +979,18 @@ module_setup_samba_ad() {
         DNS_BACKEND_NAME="BIND9 DLZ"
     fi
 
-    echo ""
-    echo -e "${GREEN}------------------ XAC NHAN THONG TIN ------------------${NC}"
-    echo " - Domain FQDN    : ${SERVER_HOSTNAME}.${DOMAIN_NAME}"
-    echo " - Realm Kerberos : ${REALM}"
-    echo " - NetBIOS Name   : ${NETBIOS_NAME}"
-    echo " - Card mang DC   : ${INTERFACE}"
-    echo " - Dia chi IP DC  : ${STATIC_IP}/${NETMASK}"
-    echo " - DNS Backend    : ${DNS_BACKEND_NAME}"
-    echo " - DNS Forwarder  : ${DNS_FORWARDER}"
-    echo " - Password Admin : ${ADMIN_PASS}"
-    echo -e "${GREEN}--------------------------------------------------------${NC}"
-    read -rp "Ban co chac chan muon tien hanh? (y/n): " CONFIRM
-    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
-        log_warn "Da dung thao tac."
-        return 0
-    fi
-
     log_step "[1/9] Thiet lap Hostname va /etc/hosts..."
     hostnamectl set-hostname "${SERVER_HOSTNAME}.${DOMAIN_NAME}"
     log_success "Da doi hostname thanh: $(hostname)"
 
-    cat << EOF > /etc/hosts
+    cat << EOF_HOSTS > /etc/hosts
 127.0.0.1   localhost localhost.localdomain localhost4 localhost4.localdomain4
 ::1         localhost localhost.localdomain localhost6 localhost6.localdomain6
 ${STATIC_IP} ${SERVER_HOSTNAME}.${DOMAIN_NAME} ${SERVER_HOSTNAME}
-EOF
+EOF_HOSTS
     log_success "Da cap nhat file /etc/hosts."
 
-    log_step "Cap nhat DNS 127.0.0.1 tren card $INTERFACE (Giu nguyen routing WAN)..."
+    log_step "Cap nhat DNS 127.0.0.1 tren card $INTERFACE..."
     nmcli con mod "$INTERFACE" ipv4.dns "127.0.0.1" 2>/dev/null || true
     nmcli con up "$INTERFACE" || true
 
@@ -994,13 +1020,13 @@ EOF
     wget -q -O /etc/pki/rpm-gpg/RPM-GPG-KEY-TISSAMBA-9 https://samba.tranquil.it/RPM-GPG-KEY-TISSAMBA-9
     rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-TISSAMBA-9
 
-    cat << EOF > /etc/yum.repos.d/tissamba.repo
+    cat << 'EOF_REPO' > /etc/yum.repos.d/tissamba.repo
 [tis-samba]
 name=tis-samba
 baseurl=https://samba.tranquil.it/redhat9/samba-4.24/
 gpgcheck=1
 gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-TISSAMBA-9
-EOF
+EOF_REPO
 
     local COMMON_PACKAGES="samba samba-dc samba-winbind samba-winbind-clients krb5-workstation ldb-tools bind-utils chrony samba-client python3-markdown"
     if [ "$DNS_BACKEND" == "BIND9_DLZ" ]; then
@@ -1011,7 +1037,7 @@ EOF
     log_success "Cai dat goi phan mem Samba AD hoan tat."
 
     log_step "[5/9] Khoi tao file cau hinh Kerberos /etc/krb5.conf..."
-    cat << EOF > /etc/krb5.conf
+    cat << EOF_KRB > /etc/krb5.conf
 [libdefaults]
     default_realm = ${REALM}
     dns_lookup_kdc = false
@@ -1021,7 +1047,7 @@ EOF
     ${REALM} = {
         kdc = 127.0.0.1
     }
-EOF
+EOF_KRB
     log_success "Da tao file Kerberos config."
 
     log_step "[6/9] Khoi tao AD DC (Provisioning)..."
@@ -1065,10 +1091,10 @@ EOF
 
     local NETWORK_SUBNET
     NETWORK_SUBNET=$(echo "$STATIC_IP" | cut -d. -f1-3).0
-    cat << EOF >> /etc/chrony.conf
+    cat << EOF_CHRONY >> /etc/chrony.conf
 ntpsigndsocket /var/lib/samba/ntp_signd
 allow ${NETWORK_SUBNET}/${NETMASK}
-EOF
+EOF_CHRONY
     systemctl restart chronyd
     log_success "Chrony da duoc dong bo voi NTP sign socket."
 
@@ -1078,12 +1104,8 @@ EOF
         BIND_VER=$(named -v 2>/dev/null | awk '{print $2}' | cut -d. -f1,2)
         if [ -f "/var/lib/samba/bind-dns/named.conf" ]; then
             case "$BIND_VER" in
-                "9.16")
-                    sed -i -E 's|#\s*(database "dlopen .*/dlz_bind9_16.so";)|\1|' /var/lib/samba/bind-dns/named.conf
-                    ;;
-                "9.18")
-                    sed -i -E 's|#\s*(database "dlopen .*/dlz_bind9_18.so";)|\1|' /var/lib/samba/bind-dns/named.conf
-                    ;;
+                "9.16") sed -i -E 's|#\s*(database "dlopen .*/dlz_bind9_16.so";)|\1|' /var/lib/samba/bind-dns/named.conf ;;
+                "9.18") sed -i -E 's|#\s*(database "dlopen .*/dlz_bind9_18.so";)|\1|' /var/lib/samba/bind-dns/named.conf ;;
                 *)
                     local MODULE
                     MODULE=$(find /usr/lib64/samba/bind9 /usr/lib/samba/bind9 -name "dlz_bind9*.so" 2>/dev/null | sort -V | tail -n1)
@@ -1096,77 +1118,42 @@ EOF
             esac
         fi
 
-        cat << EOF > /etc/named.conf
+        cat << EOF_BIND_AD > /etc/named.conf
 options {
     listen-on port 53 { any; };
     listen-on-v6 { none; };
     directory "/var/named";
-    dump-file "/var/named/data/cache_dump.db";
-    statistics-file "/var/named/data/named_stats.txt";
-    memstatistics-file "/var/named/data/named_mem_stats.txt";
-    secroots-file "/var/named/data/named.secroots";
-    recursing-file "/var/named/data/named.recursing";
-
     allow-query { any; };
     allow-recursion { any; };
     recursion yes;
     dnssec-validation no;
-
     forwarders {
         ${DNS_FORWARDER};
     };
-
     tkey-gssapi-keytab "/var/lib/samba/bind-dns/dns.keytab";
     minimal-responses yes;
 };
-
-logging {
-    channel default_debug {
-        file "data/named.run";
-        severity dynamic;
-    };
-};
-
 include "/var/lib/samba/bind-dns/named.conf";
-EOF
-        echo 'OPTIONS="-4"' > /etc/sysconfig/named
-        chown -R root:named /var/lib/samba/bind-dns
-        chmod 750 /var/lib/samba/bind-dns
-        chmod 640 /var/lib/samba/bind-dns/dns.keytab 2>/dev/null || true
-        chmod 750 /var/lib/samba/private
-        chgrp -R named /var/lib/samba/private 2>/dev/null || true
-    else
-        log_step "Tat va mask dich vu named de tranh xung dot Port 53 voi Samba DNS..."
-        systemctl disable --now named 2>/dev/null || true
-        systemctl mask named 2>/dev/null || true
-    fi
-
-    # 9. KHOI DONG DICH VU & TU DONG TAO ZONE NGHICH + PTR TREN AD
-    log_step "[9/9] Khoi dong cac dich vu va tu dong tao Zone nghich tren AD..."
-    
-    systemctl disable --now smb nmb winbind 2>/dev/null || true
-    systemctl mask smb nmb winbind 2>/dev/null || true
-
-    if [ "$DNS_BACKEND" == "BIND9_DLZ" ]; then
-        log_step "  -> Enable va Restart Named & Samba..."
+EOF_BIND_AD
         systemctl enable named samba
         systemctl restart named
         systemctl restart samba
     else
-        log_step "  -> Enable va Restart Samba AD DC..."
+        log_step "Tat va mask dich vu named de giai phong Port 53 cho Samba DNS..."
+        systemctl disable --now named 2>/dev/null || true
+        systemctl mask named 2>/dev/null || true
         systemctl enable samba
         systemctl restart samba
     fi
 
-    log_step "  -> Restart Chrony..."
+    log_step "[9/9] Khoi dong cac dich vu va tu dong tao Zone nghich tren AD..."
+    systemctl disable --now smb nmb winbind 2>/dev/null || true
+    systemctl mask smb nmb winbind 2>/dev/null || true
+
     systemctl restart chronyd
-
-    log_step "  -> Reload Firewalld..."
     firewall-cmd --reload
-
     sleep 3
 
-    # --- TU DONG TAO ZONE NGHICH VA BAN GHI PTR CHO SAMBA AD DC ---
     calc_reverse_zone_info "$STATIC_IP"
     local AD_REV_ZONE="$CALC_REV_ZONE"
     local AD_PTR_PREFIX="$CALC_PTR_PREFIX"
@@ -1178,70 +1165,14 @@ EOF
     log_step "Dang tao ban ghi PTR ($STATIC_IP -> ${DC_FQDN})..."
     samba-tool dns add 127.0.0.1 "$AD_REV_ZONE" "$AD_PTR_PREFIX" PTR "${DC_FQDN}." -U administrator --password="${ADMIN_PASS}" 2>/dev/null || true
 
-    # Dong bo DHCP Server neu co
     if [ -f /etc/dhcp/dhcpd.conf ]; then
         log_step "  -> Phat hien DHCP Server dang cai dat. Dang cap nhat DNS sang $STATIC_IP..."
         sed -i -E "s/option domain-name-servers .*/option domain-name-servers ${STATIC_IP};/" /etc/dhcp/dhcpd.conf
-        if systemctl is-active --quiet dhcpd || systemctl is-enabled --quiet dhcpd 2>/dev/null; then
-            log_step "  -> Restart dich vu dhcpd..."
-            systemctl restart dhcpd && log_success "Da cap nhat DHCP DNS sang $STATIC_IP va restart dhcpd thanh cong."
-        fi
+        systemctl restart dhcpd 2>/dev/null || true
     fi
 
     echo -e "nameserver 127.0.0.1\nnameserver ${DNS_FORWARDER}" > /etc/resolv.conf
-
-    sleep 2
-    log_success "TOAN BO CAC DICH VU VA ZONE NGHICH DA SAN SANG!"
-
-    echo ""
-    echo -e "${GREEN}==================================================================${NC}"
-    echo -e "${GREEN}          DA CAI DAT SAMBA ACTIVE DIRECTORY THANH CONG!          ${NC}"
-    echo -e "${GREEN}==================================================================${NC}"
-    echo -e " 1. Domain (FQDN)     : ${DOMAIN_NAME}"
-    echo -e " 2. Realm Kerberos    : ${REALM}"
-    echo -e " 3. NetBIOS Name      : ${NETBIOS_NAME}"
-    echo -e " 4. Server FQDN       : ${DC_FQDN}"
-    echo -e " 5. Dia chi IP DC     : ${STATIC_IP}"
-    echo -e " 6. DNS Backend       : ${DNS_BACKEND_NAME}"
-    echo -e " 7. Zone nghich AD    : ${AD_REV_ZONE} (PTR -> ${DC_FQDN})"
-    echo -e " 8. Tai khoan Admin   : administrator"
-    echo -e "${YELLOW} 9. Mat khau Admin    : ${ADMIN_PASS}${NC}"
-    echo ""
-    echo -e "${CYAN}------------------------ KIEM TRA KET NOI ------------------------${NC}"
-    
-    if ss -tulpn | grep -q ":53 "; then
-        log_success "Port 53 DNS dang hoat dong tot."
-    else
-        log_error "Port 53 DNS chua hoat dong!"
-    fi
-
-    if echo "${ADMIN_PASS}" | kinit administrator >/dev/null 2>&1; then
-        log_success "Kerberos Ticket (kinit administrator): XAC THUC TOT."
-    else
-        log_error "Kerberos Ticket (kinit administrator): THAT BAI."
-    fi
-
-    # Kiem tra ca phan giai thuan lan phan giai nghich (PTR)
-    local DNS_TEST_FWD DNS_TEST_REV
-    DNS_TEST_FWD=$(dig +short @127.0.0.1 "${DOMAIN_NAME}")
-    DNS_TEST_REV=$(dig +short -x "$STATIC_IP" @127.0.0.1)
-
-    if [ "$DNS_TEST_FWD" == "$STATIC_IP" ]; then
-        log_success "DNS Lookup thuan: $DOMAIN_NAME -> $STATIC_IP [OK]"
-    fi
-
-    if [ -n "$DNS_TEST_REV" ]; then
-        log_success "DNS Lookup nghich (PTR): $STATIC_IP -> $DNS_TEST_REV [OK]"
-    else
-        log_warn "Chua phan giai duoc PTR ngay lap tuc. Cho vai giay de Samba dong bo."
-    fi
-
-    echo ""
-    echo -e "${YELLOW}KHI SANG MAY CLIENT TEST NSLOOKUP:${NC}"
-    echo -e " 1. Mo CMD tren Windows Client, go: ${CYAN}nslookup${NC}"
-    echo -e "    -> 'Default Server' se hien thi: ${GREEN}${DC_FQDN}${NC} (Khong con UnKnown)."
-    echo -e " 2. Gia nhap domain binh thuong bang user: administrator"
-    echo -e "${GREEN}==================================================================${NC}"
+    log_success "Samba Active Directory DC da san sang!"
 }
 
 # ==============================================================================
@@ -1251,42 +1182,25 @@ module_remove_samba_ad() {
     echo -e "\n${RED}==================================================================${NC}"
     echo -e "${RED}         11. XOA BO VA GO BO HOAN TOAN SAMBA AD DC                ${NC}"
     echo -e "${RED}==================================================================${NC}"
-    log_warn "Thao tac nay se dung dich vu Samba AD DC, xoa toan bo co so du lieu AD,"
-    log_warn "tai khoan mien, Kerberos va mo khoa cac tien trinh named/smb/nmb."
-    read -rp "Ban co chac chan muon xoa bo Samba AD DC khoi may? (y/n): " CONFIRM_RM
-    if [[ ! "$CONFIRM_RM" =~ ^[Yy]$ ]]; then
-        log_warn "Da huy thao tac xoa Samba AD DC."
-        return 0
-    fi
+    read -rp "Xac nhan xoa Samba AD DC khoi he thong? (y/n): " CONFIRM_RM
+    [[ ! "$CONFIRM_RM" =~ ^[Yy]$ ]] && return 0
 
     log_step "[1/6] Dung va vo hieu hoa dich vu Samba AD DC..."
     systemctl stop samba 2>/dev/null || true
     systemctl disable samba 2>/dev/null || true
-    log_success "Da dung service samba."
 
-    log_step "[2/6] Mo khoa (unmask) cac tien trinh he thong (smb, nmb, winbind, named)..."
+    log_step "[2/6] Mo khoa (unmask) smb, nmb, winbind, named..."
     systemctl unmask smb nmb winbind named 2>/dev/null || true
-    log_success "Da unmask smb, nmb, winbind, named."
 
-    log_step "[3/6] Xoa bo co so du lieu AD (LDB), Keytab, Kerberos va Socket NTP..."
-    rm -rf /var/lib/samba/private
-    rm -rf /var/lib/samba/bind-dns
-    rm -rf /var/lib/samba/ntp_signd
-    rm -f /etc/krb5.conf
-    rm -f /etc/samba/smb.conf
-
-    if [ -f /etc/samba/smb.conf.ad.bak ]; then
-        log_step "Khoi phuc lai file /etc/samba/smb.conf truoc khi cai AD..."
-        mv /etc/samba/smb.conf.ad.bak /etc/samba/smb.conf
-        log_success "Da khoi phuc /etc/samba/smb.conf."
-    fi
+    log_step "[3/6] Xoa bo co so du lieu AD..."
+    rm -rf /var/lib/samba/private /var/lib/samba/bind-dns /var/lib/samba/ntp_signd /etc/krb5.conf /etc/samba/smb.conf
+    [ -f /etc/samba/smb.conf.ad.bak ] && mv /etc/samba/smb.conf.ad.bak /etc/samba/smb.conf
 
     log_step "[4/6] Don dep cau hinh Chrony NTP..."
     sed -i '/ntpsigndsocket/d' /etc/chrony.conf
     systemctl restart chronyd 2>/dev/null || true
-    log_success "Da don dep /etc/chrony.conf."
 
-    log_step "[5/6] Dong cac port tuong lua dac thu cua Active Directory..."
+    log_step "[5/6] Dong cac port tuong lua Active Directory..."
     for z in internal public; do
         firewall-cmd --zone=$z --permanent --remove-port={88,389,464}/tcp >/dev/null 2>&1 || true
         firewall-cmd --zone=$z --permanent --remove-port={88,389,464}/udp >/dev/null 2>&1 || true
@@ -1294,22 +1208,603 @@ module_remove_samba_ad() {
         firewall-cmd --zone=$z --permanent --remove-port=49152-65535/tcp >/dev/null 2>&1 || true
     done
     firewall-cmd --reload >/dev/null 2>&1 || true
-    log_success "Da dong cac port Active Directory tren Firewalld."
 
-    log_step "[6/6] Khoi phuc DNS local (/etc/resolv.conf)..."
+    log_step "[6/6] Khoi phuc DNS local..."
     echo "nameserver 8.8.8.8" > /etc/resolv.conf
-    log_success "Da cap nhat lai DNS 8.8.8.8 trong /etc/resolv.conf."
+    log_success "Da xoa sach Samba AD DC!"
+}
 
-    echo ""
-    read -rp "Ban co muon go bo goi rpm Samba AD DC (samba-dc, krb5...) khong? (y/n) [n]: " RM_PKGS
-    if [[ "$RM_PKGS" =~ ^[Yy]$ ]]; then
-        log_step "Dang go bo cac goi phan mem Samba DC va repo Tranquil IT..."
-        dnf remove -y samba-dc samba-dc-bind-dlz 2>/dev/null || true
-        rm -f /etc/yum.repos.d/tissamba.repo
-        log_success "Da go bo cac package va repository Samba DC."
+# ==============================================================================
+# 12. CAU HINH MAIL SERVER CO BAN (POSTFIX + DOVECOT - LOCAL USER)
+# ==============================================================================
+module_setup_mail_basic() {
+    echo -e "\n${BLUE}================================================================${NC}"
+    echo -e "${BLUE}   12. CAU HINH MAIL SERVER LOCAL USER (POSTFIX + DOVECOT)      ${NC}"
+    echo -e "${BLUE}================================================================${NC}"
+
+    get_lan_topology_info
+
+    read -rp "1. Nhap Ten mien (Domain) [nhom5.local]: " DOMAIN
+    DOMAIN=${DOMAIN:-nhom5.local}
+
+    read -rp "2. Nhap FQDN Mail Server [mail.$DOMAIN]: " MAIL_FQDN
+    MAIL_FQDN=${MAIL_FQDN:-mail.$DOMAIN}
+
+    echo -e "${CYAN}[*] Dai mang LAN noi bo tu dong nhan dien: $TOPOLOGY_LAN_SUBNET${NC}"
+    read -rp "3. Dai mang tin cay (Trusted Subnet) [$TOPOLOGY_LAN_SUBNET]: " TRUSTED_NET
+    TRUSTED_NET=${TRUSTED_NET:-$TOPOLOGY_LAN_SUBNET}
+
+    read -rp "4. Ban co muon doi Hostname he thong thanh $MAIL_FQDN khong? (y/n) [n]: " CHANGE_HOST
+    CHANGE_HOST=${CHANGE_HOST:-n}
+    if [[ "$CHANGE_HOST" =~ ^[Yy]$ ]]; then
+        hostnamectl set-hostname "$MAIL_FQDN"
+        log_success "Da cap nhat Hostname he thong thanh: $MAIL_FQDN"
+    else
+        log_warn "Giu nguyen Hostname he thong hien tai: $(hostname)"
     fi
 
-    log_success "DA XOA BO HOAN TOAN SAMBA ACTIVE DIRECTORY DC KHOI HE THONG!"
+    if ! grep -q "$MAIL_FQDN" /etc/hosts; then
+        echo "$TOPOLOGY_LAN_IP $MAIL_FQDN mail" >> /etc/hosts
+        log_success "Da them '$TOPOLOGY_LAN_IP $MAIL_FQDN mail' vao /etc/hosts."
+    fi
+
+    echo ""
+    log_step "[Buoc 1/7] Cai dat Postfix, Dovecot va cac cong cu kiem thu..."
+    dnf install -y postfix dovecot s-nail telnet openssl
+    log_success "Cai dat cac goi Mail hoan tat."
+
+    log_step "[Buoc 2/7] Tao chung chi SSL tu ky cho $MAIL_FQDN..."
+    local SSL_DIR="/etc/pki/tls/mail"
+    mkdir -p "$SSL_DIR"
+    openssl req -new -x509 -days 3650 -nodes \
+        -out "$SSL_DIR/mail.crt" \
+        -keyout "$SSL_DIR/mail.key" \
+        -subj "/C=VN/ST=HCM/L=HCM/O=MailServer/CN=$MAIL_FQDN" 2>/dev/null
+    chmod 600 "$SSL_DIR/mail.key"
+    chmod 644 "$SSL_DIR/mail.crt"
+    log_success "Chung chi SSL da duoc luu tai $SSL_DIR."
+
+    log_step "[Buoc 3/7] Cau hinh Postfix MTA (main.cf, master.cf)..."
+    [ -f /etc/postfix/main.cf.bak ] || cp /etc/postfix/main.cf /etc/postfix/main.cf.bak
+
+    postconf -e "myhostname = $MAIL_FQDN"
+    postconf -e "mydomain = $DOMAIN"
+    postconf -e "myorigin = \$mydomain"
+    postconf -e "inet_interfaces = all"
+    postconf -e "inet_protocols = ipv4"
+    postconf -e "mydestination = \$myhostname, localhost.\$mydomain, localhost, \$mydomain"
+    postconf -e "mynetworks = 127.0.0.0/8, $TRUSTED_NET"
+    postconf -e "home_mailbox = Maildir/"
+
+    postconf -e "smtpd_sasl_type = dovecot"
+    postconf -e "smtpd_sasl_path = private/auth"
+    postconf -e "smtpd_sasl_auth_enable = yes"
+    postconf -e "smtpd_sasl_security_options = noanonymous"
+    postconf -e "smtpd_recipient_restrictions = permit_sasl_authenticated, permit_mynetworks, reject_unauth_destination"
+    postconf -e "smtpd_tls_auth_only = no"
+    postconf -e "smtpd_tls_cert_file = $SSL_DIR/mail.crt"
+    postconf -e "smtpd_tls_key_file = $SSL_DIR/mail.key"
+    postconf -e "smtpd_tls_security_level = may"
+
+    sed -i 's/^#\?submission inet n       -       n       -       -       smtpd/submission inet n       -       n       -       -       smtpd/' /etc/postfix/master.cf
+    sed -i '/^submission inet/,/^[^ ]/ s/^#\?  -o syslog_name=postfix\/submission/  -o syslog_name=postfix\/submission/' /etc/postfix/master.cf
+    sed -i '/^submission inet/,/^[^ ]/ s/^#\?  -o smtpd_sasl_auth_enable=yes/  -o smtpd_sasl_auth_enable=yes/' /etc/postfix/master.cf
+    sed -i '/^submission inet/,/^[^ ]/ s/^#\?  -o smtpd_reject_unlisted_recipient=no/  -o smtpd_reject_unlisted_recipient=no/' /etc/postfix/master.cf
+    sed -i '/^submission inet/,/^[^ ]/ s/^#\?  -o smtpd_recipient_restrictions=permit_sasl_authenticated,reject/  -o smtpd_recipient_restrictions=permit_sasl_authenticated,reject/' /etc/postfix/master.cf
+    log_success "Cau hinh Postfix MTA thanh cong!"
+
+    log_step "[Buoc 4/7] Cau hinh Dovecot MDA va SASL authentication..."
+    sed -i 's/^#\?protocols =.*/protocols = imap pop3 lmtp/' /etc/dovecot/dovecot.conf
+    sed -i 's/^#\?listen =.*/listen = *, ::/' /etc/dovecot/dovecot.conf
+
+    sed -i 's|^#\?mail_location =.*|mail_location = maildir:~/Maildir|' /etc/dovecot/conf.d/10-mail.conf
+    sed -i 's/^#\?disable_plaintext_auth =.*/disable_plaintext_auth = no/' /etc/dovecot/conf.d/10-auth.conf
+    sed -i 's/^#\?auth_mechanisms =.*/auth_mechanisms = plain login/' /etc/dovecot/conf.d/10-auth.conf
+
+    sed -i 's/^#\?ssl =.*/ssl = yes/' /etc/dovecot/conf.d/10-ssl.conf
+    sed -i "s|^#\?ssl_cert =.*|ssl_cert = <$SSL_DIR/mail.crt|" /etc/dovecot/conf.d/10-ssl.conf
+    sed -i "s|^#\?ssl_key =.*|ssl_key = <$SSL_DIR/mail.key|" /etc/dovecot/conf.d/10-ssl.conf
+
+    cat << 'EOF_DOVECOT_LOCAL' > /etc/dovecot/conf.d/10-master.conf
+service imap-login {
+  inet_listener imap {
+    port = 143
+  }
+  inet_listener imaps {
+    port = 993
+    ssl = yes
+  }
+}
+
+service pop3-login {
+  inet_listener pop3 {
+    port = 110
+  }
+  inet_listener pop3s {
+    port = 995
+    ssl = yes
+  }
+}
+
+service lmtp {
+}
+
+service imap {
+}
+
+service pop3 {
+}
+
+service auth {
+  unix_listener auth-userdb {
+  }
+
+  unix_listener /var/spool/postfix/private/auth {
+    mode = 0660
+    user = postfix
+    group = postfix
+  }
+}
+
+service auth-worker {
+}
+
+service dict {
+}
+EOF_DOVECOT_LOCAL
+    log_success "Cau hinh Dovecot 10-master.conf chuan cu phap hoan tat."
+
+    log_step "[Buoc 5/7] Thiet lap Maildir skeleton va khoi tao user local..."
+    mkdir -p /etc/skel/Maildir/{cur,new,tmp}
+    chmod -R 700 /etc/skel/Maildir
+
+    read -rp "Nhap danh sach tai khoan local muon tao (cach nhau boi khoang trang) [tien xuyen]: " LOCAL_USERS
+    LOCAL_USERS=${LOCAL_USERS:-tien xuyen}
+    for u in $LOCAL_USERS; do
+        if ! id "$u" &>/dev/null; then
+            useradd -m "$u"
+            echo "$u:qtmmtK24@" | chpasswd
+            mkdir -p "/home/$u/Maildir/"{cur,new,tmp}
+            chown -R "$u:$u" "/home/$u/Maildir"
+            chmod -R 700 "/home/$u/Maildir"
+            log_success "Da tao user: $u@$DOMAIN (Mat khau mac dinh: qtmmtK24@)"
+        else
+            log_warn "User $u da ton tai."
+        fi
+    done
+
+    log_step "[Buoc 6/7] Kiem tra cu phap cac dich vu..."
+    if doveconf -n >/dev/null; then
+        log_success "Cu phap Dovecot: [HOP LE]"
+    else
+        log_error "Loi cu phap Dovecot!"
+        doveconf -n
+        return 1
+    fi
+
+    if postfix check; then
+        log_success "Cu phap Postfix: [HOP LE]"
+    else
+        log_error "Loi cu phap Postfix!"
+        return 1
+    fi
+
+    log_step "[Buoc 7/7] Mo port Firewalld va khoi chay dich vu..."
+    if systemctl is-active --quiet firewalld; then
+        for z in internal public; do
+            firewall-cmd --zone=$z --permanent --add-port={25,110,143,587,993,995}/tcp
+            firewall-cmd --zone=$z --permanent --add-service={smtp,smtp-submission,imap,imaps,pop3,pop3s} >/dev/null 2>&1 || true
+        done
+        firewall-cmd --reload
+        log_success "Da mo cac port Mail tren ca internal va public."
+    fi
+
+    systemctl enable --now postfix dovecot
+    systemctl restart postfix dovecot
+    add_dns_mail_records "$DOMAIN" "$MAIL_FQDN" "$TOPOLOGY_LAN_IP"
+
+    echo ""
+    echo -e "${GREEN}================================================================${NC}"
+    echo -e "${GREEN}       DA CAI DAT MAIL SERVER LOCAL USER THANH CONG!            ${NC}"
+    echo -e "${GREEN}================================================================${NC}"
+    systemctl is-active --quiet postfix && echo -e "  - Postfix: ${GREEN}RUNNING${NC}" || echo -e "  - Postfix: ${RED}STOPPED${NC}"
+    systemctl is-active --quiet dovecot && echo -e "  - Dovecot: ${GREEN}RUNNING${NC}" || echo -e "  - Dovecot: ${RED}STOPPED${NC}"
+    echo -e "  - Domain:        ${CYAN}$DOMAIN${NC}"
+    echo -e "  - Mail Hostname: ${CYAN}$MAIL_FQDN${NC}"
+    echo -e "  - IMAP:          Port 143 (STARTTLS/Plain) | Port 993 (SSL/TLS)"
+    echo -e "  - POP3:          Port 110 (STARTTLS/Plain) | Port 995 (SSL/TLS)"
+    echo -e "  - SMTP:          Port 25 (Internal)       | Port 587 (Submission)"
+    echo -e "  - Client Setup:  Dung Thunderbird ket noi vao $MAIL_FQDN voi cac user vua tao."
+    echo -e "${GREEN}================================================================${NC}"
+}
+
+# ==============================================================================
+# 13. CAU HINH ENTERPRISE WEBMAIL (PHP 8.3 APPSTREAM + ROUNDCUBE + POSTFIXADMIN)
+# ==============================================================================
+module_setup_webmail_enterprise() {
+    echo -e "\n${BLUE}====================================================================${NC}"
+    echo -e "${BLUE}   13. CAU HINH ENTERPRISE WEBMAIL (PHP 8.3 GOC + ROUNDCUBE)        ${NC}"
+    echo -e "${BLUE}====================================================================${NC}"
+
+    get_lan_topology_info
+
+    read -rp "1. Nhap Ten mien (Domain) [nhom5.local]: " DOMAIN
+    DOMAIN=${DOMAIN:-nhom5.local}
+
+    read -rp "2. Nhap FQDN Mail Server [mail.$DOMAIN]: " MAIL_FQDN
+    MAIL_FQDN=${MAIL_FQDN:-mail.$DOMAIN}
+
+    echo -e "${CYAN}[*] Dai mang LAN noi bo tu dong nhan dien: $TOPOLOGY_LAN_SUBNET${NC}"
+    read -rp "3. Dai mang tin cay (Trusted Subnet) [$TOPOLOGY_LAN_SUBNET]: " TRUSTED_NET
+    TRUSTED_NET=${TRUSTED_NET:-$TOPOLOGY_LAN_SUBNET}
+
+    read -rp "4. Ban co muon doi Hostname he thong thanh $MAIL_FQDN khong? (y/n) [n]: " CHANGE_HOST
+    CHANGE_HOST=${CHANGE_HOST:-n}
+    if [[ "$CHANGE_HOST" =~ ^[Yy]$ ]]; then
+        hostnamectl set-hostname "$MAIL_FQDN"
+        log_success "Da cap nhat Hostname he thong thanh: $MAIL_FQDN"
+    else
+        log_warn "Giu nguyen Hostname he thong hien tai: $(hostname)"
+    fi
+
+    if ! grep -q "$MAIL_FQDN" /etc/hosts; then
+        echo "$TOPOLOGY_LAN_IP $MAIL_FQDN mail" >> /etc/hosts
+        log_success "Da them '$TOPOLOGY_LAN_IP $MAIL_FQDN mail' vao /etc/hosts."
+    fi
+
+    read -rp "5. Mat khau chung cho Database (mailuser, roundcube) [qtmmtK24@]: " DB_COMMON_PASS
+    DB_COMMON_PASS=${DB_COMMON_PASS:-qtmmtK24@}
+
+    read -rp "6. Email admin he thong [admin@$DOMAIN]: " ADMIN_EMAIL
+    ADMIN_EMAIL=${ADMIN_EMAIL:-admin@$DOMAIN}
+
+    # Ma hoa ky tu @ thanh %40 cho chuoi ket noi MySQL DSN cua Roundcube
+    local DB_COMMON_PASS_URL
+    DB_COMMON_PASS_URL=$(echo -n "$DB_COMMON_PASS" | sed 's/@/%40/g')
+
+    echo ""
+    log_step "[Buoc 1/11] Kich hoat Module PHP 8.3 goc AppStream CentOS 9 (khong can Remi)..."
+    dnf module reset php -y
+    dnf module enable php:8.3 -y
+    log_success "PHP 8.3 AppStream da duoc kich hoat."
+
+    log_step "[Buoc 2/11] Cai dat Nginx, MariaDB, Postfix, Dovecot va PHP 8.3 extensions..."
+    dnf install -y nginx mariadb-server \
+        php php-fpm php-mysqlnd php-mbstring php-intl php-xml php-curl php-zip php-gd \
+        postfix postfix-mysql dovecot dovecot-mysql \
+        tar wget openssl nano s-nail
+    log_success "Cai dat cac goi thanh cong."
+
+    log_step "[Buoc 3/11] Thiet lap tai khoan vmail (UID/GID 5000) va tao SSL tu ky..."
+    if ! id "vmail" &>/dev/null; then
+        groupadd -g 5000 vmail
+        useradd -g vmail -u 5000 vmail -d /var/vmail -m -s /sbin/nologin
+    fi
+    chmod 770 /var/vmail
+
+    local SSL_DIR="/etc/pki/tls/mail"
+    mkdir -p "$SSL_DIR"
+    openssl req -new -x509 -days 3650 -nodes \
+        -out "$SSL_DIR/mail.crt" \
+        -keyout "$SSL_DIR/mail.key" \
+        -subj "/C=VN/ST=HCM/L=HCM/O=MailServer/CN=$MAIL_FQDN" 2>/dev/null
+    chmod 600 "$SSL_DIR/mail.key"
+    chmod 644 "$SSL_DIR/mail.crt"
+    log_success "Chung chi SSL san sang tai $SSL_DIR."
+
+    log_step "[Buoc 4/11] Khoi dong MariaDB va tao co so du lieu / user..."
+    systemctl enable --now mariadb
+    mysql -u root << EOF_SQL
+CREATE DATABASE IF NOT EXISTS mailserver CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS 'mailuser'@'127.0.0.1' IDENTIFIED BY '$DB_COMMON_PASS';
+ALTER USER 'mailuser'@'127.0.0.1' IDENTIFIED BY '$DB_COMMON_PASS';
+GRANT ALL PRIVILEGES ON mailserver.* TO 'mailuser'@'127.0.0.1';
+
+CREATE DATABASE IF NOT EXISTS roundcubemail CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS 'roundcube'@'localhost' IDENTIFIED BY '$DB_COMMON_PASS';
+CREATE USER IF NOT EXISTS 'roundcube'@'127.0.0.1' IDENTIFIED BY '$DB_COMMON_PASS';
+ALTER USER 'roundcube'@'localhost' IDENTIFIED BY '$DB_COMMON_PASS';
+ALTER USER 'roundcube'@'127.0.0.1' IDENTIFIED BY '$DB_COMMON_PASS';
+GRANT ALL PRIVILEGES ON roundcubemail.* TO 'roundcube'@'localhost';
+GRANT ALL PRIVILEGES ON roundcubemail.* TO 'roundcube'@'127.0.0.1';
+
+FLUSH PRIVILEGES;
+EOF_SQL
+    log_success "Co so du lieu MariaDB khoi tao thanh cong."
+
+    log_step "[Buoc 5/11] Cai dat PostfixAdmin 3.3.13..."
+    mkdir -p /var/www/html/postfixadmin /tmp/pfa_extract
+    local PFA_URL="https://github.com/postfixadmin/postfixadmin/archive/postfixadmin-3.3.13.tar.gz"
+    wget -q "$PFA_URL" -O /tmp/pfa.tar.gz
+    tar -xzf /tmp/pfa.tar.gz -C /tmp/pfa_extract
+    cp -rf /tmp/pfa_extract/*/* /var/www/html/postfixadmin/
+    rm -rf /tmp/pfa_extract /tmp/pfa.tar.gz
+    mkdir -p /var/www/html/postfixadmin/templates_c
+
+    cat << 'EOF_PFA' > /var/www/html/postfixadmin/config.local.php
+<?php
+$CONF['configured'] = true;
+$CONF['setup_password'] = '__SETUP_PASS__';
+$CONF['database_type'] = 'mysqli';
+$CONF['database_host'] = '127.0.0.1';
+$CONF['database_user'] = 'mailuser';
+$CONF['database_password'] = '__DB_PASS__';
+$CONF['database_name'] = 'mailserver';
+$CONF['admin_email'] = '__ADMIN_EMAIL__';
+$CONF['encrypt'] = 'php_crypt:BLOWFISH';
+$CONF['default_aliases'] = array();
+$CONF['domain_path'] = 'YES';
+$CONF['domain_in_mailbox'] = 'NO';
+EOF_PFA
+    sed -i "s/__SETUP_PASS__/$DB_COMMON_PASS/g" /var/www/html/postfixadmin/config.local.php
+    sed -i "s/__DB_PASS__/$DB_COMMON_PASS/g" /var/www/html/postfixadmin/config.local.php
+    sed -i "s/__ADMIN_EMAIL__/$ADMIN_EMAIL/g" /var/www/html/postfixadmin/config.local.php
+    log_success "PostfixAdmin 3.3.13 da duoc giai nen va cau hinh."
+
+    log_step "[Buoc 6/11] Cau hinh Postfix Virtual Mailbox voi MariaDB..."
+    mkdir -p /etc/postfix/sql
+
+    cat << EOF_SQL_DOMAINS > /etc/postfix/sql/mysql_virtual_domains.cf
+user = mailuser
+password = $DB_COMMON_PASS
+hosts = 127.0.0.1
+dbname = mailserver
+query = SELECT domain FROM domain WHERE domain='%s' AND active = 1
+EOF_SQL_DOMAINS
+
+    cat << EOF_SQL_MAILBOXES > /etc/postfix/sql/mysql_virtual_mailboxes.cf
+user = mailuser
+password = $DB_COMMON_PASS
+hosts = 127.0.0.1
+dbname = mailserver
+query = SELECT maildir FROM mailbox WHERE username='%s' AND active = 1
+EOF_SQL_MAILBOXES
+
+    cat << EOF_SQL_ALIASES > /etc/postfix/sql/mysql_virtual_aliases.cf
+user = mailuser
+password = $DB_COMMON_PASS
+hosts = 127.0.0.1
+dbname = mailserver
+query = SELECT goto FROM alias WHERE address='%s' AND active = 1
+EOF_SQL_ALIASES
+
+    chmod 640 /etc/postfix/sql/*
+    chown root:postfix /etc/postfix/sql/*
+
+    postconf -e "myhostname = $MAIL_FQDN"
+    postconf -e "mydomain = $DOMAIN"
+    postconf -e "myorigin = \$mydomain"
+    postconf -e "inet_interfaces = all"
+    postconf -e "inet_protocols = ipv4"
+    postconf -e "mydestination = \$myhostname, localhost.\$mydomain, localhost"
+    postconf -e "mynetworks = 127.0.0.0/8, $TRUSTED_NET"
+    postconf -e "virtual_mailbox_domains = mysql:/etc/postfix/sql/mysql_virtual_domains.cf"
+    postconf -e "virtual_mailbox_maps = mysql:/etc/postfix/sql/mysql_virtual_mailboxes.cf"
+    postconf -e "virtual_alias_maps = mysql:/etc/postfix/sql/mysql_virtual_aliases.cf"
+    postconf -e "virtual_mailbox_base = /var/vmail"
+    postconf -e "virtual_minimum_uid = 5000"
+    postconf -e "virtual_uid_maps = static:5000"
+    postconf -e "virtual_gid_maps = static:5000"
+    postconf -e "smtpd_sasl_type = dovecot"
+    postconf -e "smtpd_sasl_path = private/auth"
+    postconf -e "smtpd_sasl_auth_enable = yes"
+    postconf -e "smtpd_sasl_security_options = noanonymous"
+    postconf -e "smtpd_recipient_restrictions = permit_sasl_authenticated, permit_mynetworks, reject_unauth_destination"
+    postconf -e "smtpd_tls_auth_only = no"
+    postconf -e "smtpd_tls_cert_file = $SSL_DIR/mail.crt"
+    postconf -e "smtpd_tls_key_file = $SSL_DIR/mail.key"
+    postconf -e "smtpd_tls_security_level = may"
+
+    sed -i 's/^#\?submission inet n       -       n       -       -       smtpd/submission inet n       -       n       -       -       smtpd/' /etc/postfix/master.cf
+    sed -i '/^submission inet/,/^[^ ]/ s/^#\?  -o syslog_name=postfix\/submission/  -o syslog_name=postfix\/submission/' /etc/postfix/master.cf
+    sed -i '/^submission inet/,/^[^ ]/ s/^#\?  -o smtpd_sasl_auth_enable=yes/  -o smtpd_sasl_auth_enable=yes/' /etc/postfix/master.cf
+    sed -i '/^submission inet/,/^[^ ]/ s/^#\?  -o smtpd_reject_unlisted_recipient=no/  -o smtpd_reject_unlisted_recipient=no/' /etc/postfix/master.cf
+    sed -i '/^submission inet/,/^[^ ]/ s/^#\?  -o smtpd_recipient_restrictions=permit_sasl_authenticated,reject/  -o smtpd_recipient_restrictions=permit_sasl_authenticated,reject/' /etc/postfix/master.cf
+    log_success "Cau hinh Postfix Virtual Mailbox hoan tat."
+
+    log_step "[Buoc 7/11] Cau hinh Dovecot Virtual Mailbox..."
+    cat << EOF_DOVECOT_SQL > /etc/dovecot/dovecot-sql.conf.ext
+driver = mysql
+connect = host=127.0.0.1 dbname=mailserver user=mailuser password=$DB_COMMON_PASS
+default_pass_scheme = BLF-CRYPT
+password_query = SELECT username AS user, password FROM mailbox WHERE username = '%u' AND active = 1
+user_query = SELECT CONCAT('/var/vmail/', maildir) AS home, 5000 AS uid, 5000 AS gid FROM mailbox WHERE username = '%u' AND active = 1
+iterate_query = SELECT username AS user FROM mailbox WHERE active = 1
+EOF_DOVECOT_SQL
+    chmod 600 /etc/dovecot/dovecot-sql.conf.ext
+
+    sed -i 's/^#\?protocols =.*/protocols = imap pop3 lmtp/' /etc/dovecot/dovecot.conf
+    sed -i 's/^#\?listen =.*/listen = *, ::/' /etc/dovecot/dovecot.conf
+
+    sed -i 's|^#\?mail_location =.*|mail_location = maildir:/var/vmail/%d/%n|' /etc/dovecot/conf.d/10-mail.conf
+    sed -i 's/^#\?first_valid_uid =.*/first_valid_uid = 5000/' /etc/dovecot/conf.d/10-mail.conf
+
+    sed -i 's/^!include auth-system.conf.ext/#!include auth-system.conf.ext/' /etc/dovecot/conf.d/10-auth.conf
+    sed -i 's/^#!include auth-sql.conf.ext/!include auth-sql.conf.ext/' /etc/dovecot/conf.d/10-auth.conf
+    sed -i 's/^#\?disable_plaintext_auth =.*/disable_plaintext_auth = no/' /etc/dovecot/conf.d/10-auth.conf
+    sed -i 's/^#\?auth_mechanisms =.*/auth_mechanisms = plain login/' /etc/dovecot/conf.d/10-auth.conf
+
+    sed -i 's/^#\?ssl =.*/ssl = yes/' /etc/dovecot/conf.d/10-ssl.conf
+    sed -i "s|^#\?ssl_cert =.*|ssl_cert = <$SSL_DIR/mail.crt|" /etc/dovecot/conf.d/10-ssl.conf
+    sed -i "s|^#\?ssl_key =.*|ssl_key = <$SSL_DIR/mail.key|" /etc/dovecot/conf.d/10-ssl.conf
+
+    cat << 'EOF_DOVECOT_MASTER' > /etc/dovecot/conf.d/10-master.conf
+service imap-login {
+  inet_listener imap {
+    port = 143
+  }
+  inet_listener imaps {
+    port = 993
+    ssl = yes
+  }
+}
+
+service pop3-login {
+  inet_listener pop3 {
+    port = 110
+  }
+  inet_listener pop3s {
+    port = 995
+    ssl = yes
+  }
+}
+
+service lmtp {
+}
+
+service imap {
+}
+
+service pop3 {
+}
+
+service auth {
+  unix_listener auth-userdb {
+  }
+
+  unix_listener /var/spool/postfix/private/auth {
+    mode = 0660
+    user = postfix
+    group = postfix
+  }
+}
+
+service auth-worker {
+}
+
+service dict {
+}
+EOF_DOVECOT_MASTER
+    log_success "Cau hinh Dovecot Virtual Mailbox hoan tat."
+
+    log_step "[Buoc 8/11] Cai dat Roundcube Webmail 1.6.9..."
+    mkdir -p /var/www/html/roundcube /tmp/rc_extract
+    local RC_URL="https://github.com/roundcube/roundcubemail/releases/download/1.6.9/roundcubemail-1.6.9-complete.tar.gz"
+    wget -q "$RC_URL" -O /tmp/rc.tar.gz
+    tar -xzf /tmp/rc.tar.gz -C /tmp/rc_extract
+    cp -rf /tmp/rc_extract/*/* /var/www/html/roundcube/
+    rm -rf /tmp/rc_extract /tmp/rc.tar.gz
+    mysql -u root roundcubemail < /var/www/html/roundcube/SQL/mysql.initial.sql
+
+    cat << 'EOF_RC' > /var/www/html/roundcube/config/config.inc.php
+<?php
+$config = [];
+$config['db_dsnw'] = 'mysql://roundcube:__DB_PASS_URL__@127.0.0.1/roundcubemail';
+$config['default_host'] = '127.0.0.1';
+$config['default_port'] = 143;
+$config['smtp_server'] = '127.0.0.1';
+$config['smtp_port'] = 587;
+$config['smtp_user'] = '%u';
+$config['smtp_pass'] = '%p';
+$config['smtp_auth_type'] = 'LOGIN';
+$config['smtp_conn_options'] = [
+    'ssl' => [
+        'verify_peer' => false,
+        'verify_peer_name' => false,
+        'allow_self_signed' => true
+    ]
+];
+$config['des_key'] = 'rcmail-nhom5-local-secret-token_2026!';
+$config['plugins'] = ['archive', 'zipdownload'];
+$config['skin'] = 'elastic';
+EOF_RC
+    sed -i "s/__DB_PASS_URL__/$DB_COMMON_PASS_URL/g" /var/www/html/roundcube/config/config.inc.php
+    log_success "Roundcube Webmail 1.6.9 da duoc nap co so du lieu va cau hinh."
+
+    log_step "[Buoc 9/11] Cau hinh Nginx va socket PHP-FPM..."
+    sed -i 's/^user = .*/user = nginx/' /etc/php-fpm.d/www.conf
+    sed -i 's/^group = .*/group = nginx/' /etc/php-fpm.d/www.conf
+    sed -i 's/^listen.acl_users/;&/' /etc/php-fpm.d/www.conf
+    sed -i 's/^listen.acl_groups/;&/' /etc/php-fpm.d/www.conf
+    sed -i 's/^;*listen.owner = .*/listen.owner = nginx/' /etc/php-fpm.d/www.conf
+    sed -i 's/^;*listen.group = .*/listen.group = nginx/' /etc/php-fpm.d/www.conf
+    sed -i 's/^;*listen.mode = .*/listen.mode = 0660/' /etc/php-fpm.d/www.conf
+
+    chown -R nginx:nginx /var/www/html/roundcube /var/www/html/postfixadmin
+    chown -R nginx:nginx /var/lib/php/session 2>/dev/null || true
+    chmod -R 775 /var/www/html/roundcube/temp /var/www/html/roundcube/logs /var/www/html/postfixadmin/templates_c
+
+    cat << 'EOF_NGINX_MAIL' > /etc/nginx/conf.d/mail.conf
+server {
+    listen 80;
+    server_name __MAIL_FQDN__;
+
+    root /var/www/html/roundcube;
+    index index.php index.html;
+
+    client_max_body_size 25M;
+
+    location ~ ^/(config|temp|logs)/ {
+        deny all;
+    }
+
+    location ~ /\. {
+        deny all;
+    }
+
+    location ^~ /postfixadmin {
+        alias /var/www/html/postfixadmin/public;
+        index index.php index.html;
+        try_files $uri $uri/ /postfixadmin/index.php?$args;
+
+        location ~ \.php$ {
+            include fastcgi_params;
+            fastcgi_pass unix:/run/php-fpm/www.sock;
+            fastcgi_index index.php;
+            fastcgi_param SCRIPT_FILENAME $request_filename;
+        }
+    }
+
+    location ~ \.php$ {
+        include fastcgi_params;
+        fastcgi_pass unix:/run/php-fpm/www.sock;
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.php?$args;
+    }
+}
+EOF_NGINX_MAIL
+    sed -i "s/__MAIL_FQDN__/$MAIL_FQDN/g" /etc/nginx/conf.d/mail.conf
+
+    log_step "[Buoc 10/11] Kiem tra cu phap cac dich vu..."
+    doveconf -n >/dev/null && log_success "Dovecot: [OK]" || { log_error "Dovecot syntax error"; return 1; }
+    postfix check && log_success "Postfix: [OK]" || { log_error "Postfix syntax error"; return 1; }
+    nginx -t >/dev/null 2>&1 && log_success "Nginx: [OK]" || { log_error "Nginx syntax error"; return 1; }
+
+    log_step "[Buoc 11/11] Mo port Firewalld tren ca 2 zone va khoi chay he thong..."
+    if systemctl is-active --quiet firewalld; then
+        for z in internal public; do
+            firewall-cmd --zone=$z --permanent --add-port={80,443,25,587,143,993,110,995}/tcp
+        done
+        firewall-cmd --reload
+        log_success "Da mo cac port HTTP (80), HTTPS (443) va Mail Ports."
+    fi
+
+    systemctl enable --now mariadb php-fpm nginx postfix dovecot
+    systemctl restart mariadb php-fpm nginx postfix dovecot
+
+    # Dong bo ban ghi DNS
+    add_dns_mail_records "$DOMAIN" "$MAIL_FQDN" "$TOPOLOGY_LAN_IP"
+
+    echo ""
+    echo -e "${GREEN}====================================================================${NC}"
+    echo -e "${GREEN}       DA HOAN TAT TRIEN KHAI VIRTUAL MAIL SERVER & WEBMAIL!        ${NC}"
+    echo -e "${GREEN}====================================================================${NC}"
+    systemctl is-active --quiet postfix && echo -e "  - Postfix:   ${GREEN}RUNNING${NC}" || echo -e "  - Postfix:   ${RED}STOPPED${NC}"
+    systemctl is-active --quiet dovecot && echo -e "  - Dovecot:   ${GREEN}RUNNING${NC}" || echo -e "  - Dovecot:   ${RED}STOPPED${NC}"
+    systemctl is-active --quiet nginx   && echo -e "  - Nginx:     ${GREEN}RUNNING${NC}" || echo -e "  - Nginx:     ${RED}STOPPED${NC}"
+    systemctl is-active --quiet php-fpm && echo -e "  - PHP-FPM:   ${GREEN}RUNNING (PHP 8.3 AppStream)${NC}" || echo -e "  - PHP-FPM:   ${RED}STOPPED${NC}"
+    systemctl is-active --quiet mariadb && echo -e "  - MariaDB:   ${GREEN}RUNNING${NC}" || echo -e "  - MariaDB:   ${RED}STOPPED${NC}"
+    echo "--------------------------------------------------------------------"
+    echo -e "1. Quan tri PostfixAdmin:"
+    echo -e "   - Setup ban dau:   ${CYAN}http://$MAIL_FQDN/postfixadmin/setup.php${NC}"
+    echo -e "   - Trang dang nhap: ${CYAN}http://$MAIL_FQDN/postfixadmin/${NC}"
+    echo -e "2. Giao dien Webmail Roundcube:"
+    echo -e "   - Truy cap ngay:   ${CYAN}http://$MAIL_FQDN/${NC}"
+    echo -e "${GREEN}====================================================================${NC}"
 }
 
 # ==============================================================================
@@ -1331,9 +1826,11 @@ while true; do
     echo -e "  ${YELLOW}9)${NC} Cau hinh Samba (Samba File Sharing)"
     echo -e "  ${YELLOW}10)${NC} Cau hinh Samba Active Directory (AD DC - Tu dong tao PTR)"
     echo -e "  ${YELLOW}11)${NC} Xoa bo Samba Active Directory (Go bo AD DC)"
+    echo -e "  ${YELLOW}12)${NC} Cau hinh Mail Server Local User (Postfix + Dovecot)"
+    echo -e "  ${YELLOW}13)${NC} Cau hinh Enterprise Webmail (PHP 8.3 AppStream + Roundcube)"
     echo -e "  ${YELLOW}0)${NC} Thoat"
     echo -e "${CYAN}----------------------------------------------------------------${NC}"
-    read -rp "Nhap lua chon cua ban [0-11]: " MAIN_CHOICE
+    read -rp "Nhap lua chon cua ban [0-13]: " MAIN_CHOICE
 
     case "$MAIN_CHOICE" in
         1) module_disable_selinux; pause_menu ;;
@@ -1347,6 +1844,8 @@ while true; do
         9) module_setup_samba; pause_menu ;;
         10) module_setup_samba_ad; pause_menu ;;
         11) module_remove_samba_ad; pause_menu ;;
+        12) module_setup_mail_basic; pause_menu ;;
+        13) module_setup_webmail_enterprise; pause_menu ;;
         0) echo -e "${GREEN}Tam biet!${NC}"; exit 0 ;;
         *) log_error "Lua chon khong hop le." ;;
     esac
