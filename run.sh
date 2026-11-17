@@ -159,7 +159,7 @@ setup_cups_auto_virtual_printer() {
     fi
 
     if systemctl is-active --quiet firewalld; then
-        for z in internal public; do
+        for z in internal external public; do
             firewall-cmd --zone=$z --permanent --add-port=631/tcp &>/dev/null || true
             firewall-cmd --zone=$z --permanent --add-service=ipp &>/dev/null || true
         done
@@ -545,6 +545,7 @@ EOF_NAMED
     if systemctl is-active --quiet firewalld; then
         log_step "Mo cong DNS (53 tcp/udp) tren firewalld..."
         firewall-cmd --add-service=dns --permanent --zone=internal 2>/dev/null || true
+        firewall-cmd --add-service=dns --permanent --zone=external 2>/dev/null || true
         firewall-cmd --add-service=dns --permanent --zone=public 2>/dev/null || true
         firewall-cmd --reload 2>/dev/null || true
     fi
@@ -669,7 +670,7 @@ EOF_FTP
 
     if systemctl is-active --quiet firewalld; then
         log_step "Mo port FTP (21) va Passive ports (30000-31000) tren ca 2 zone..."
-        for z in internal public; do
+        for z in internal external public; do
             firewall-cmd --permanent --zone=$z --add-service=ftp 2>/dev/null || true
             firewall-cmd --permanent --zone=$z --add-port=30000-31000/tcp 2>/dev/null || true
         done
@@ -697,7 +698,7 @@ module_setup_web() {
 
     if systemctl is-active --quiet firewalld; then
         log_step "Mo port HTTP (80) va HTTPS (443) tren Firewalld..."
-        for z in internal public; do
+        for z in internal external public; do
             firewall-cmd --zone=$z --add-service=http --permanent 2>/dev/null || true
             firewall-cmd --zone=$z --add-service=https --permanent 2>/dev/null || true
         done
@@ -834,7 +835,7 @@ module_setup_nfs() {
 
         if systemctl is-active --quiet firewalld; then
             log_step "Mo port NFS tren ca zone internal va public..."
-            for z in internal public; do
+            for z in internal external public; do
                 firewall-cmd --permanent --zone=$z --add-service=nfs 2>/dev/null || true
                 firewall-cmd --permanent --zone=$z --add-service=rpc-bind 2>/dev/null || true
                 firewall-cmd --permanent --zone=$z --add-service=mountd 2>/dev/null || true
@@ -1033,7 +1034,7 @@ EOF_SMB_PRINTERS
 
     if systemctl is-active --quiet firewalld; then
         log_step "Mo dich vu Samba tren ca 2 zone Firewalld..."
-        for z in internal public; do
+        for z in internal external public; do
             firewall-cmd --permanent --zone=$z --add-service=samba 2>/dev/null || true
         done
         firewall-cmd --reload 2>/dev/null || true
@@ -1142,7 +1143,7 @@ EOF_HOSTS
 
     log_step "[3/9] Mo cong Active Directory tren Firewalld (Zone internal & public)..."
     systemctl enable --now firewalld
-    for z in internal public; do
+    for z in internal external public; do
         firewall-cmd --zone=$z --permanent --add-port={53,88,389,464}/tcp 2>/dev/null || true
         firewall-cmd --zone=$z --permanent --add-port={53,88,389,464}/udp 2>/dev/null || true
         firewall-cmd --zone=$z --permanent --add-port=123/udp 2>/dev/null || true
@@ -1200,6 +1201,7 @@ EOF_KRB
         --domain="${NETBIOS_NAME}" \
         --server-role=dc \
         --dns-backend="${DNS_BACKEND}" \
+        --option="dns forwarder = ${DNS_FORWARDER}" \
         --use-rfc2307 \
         --adminpass="${ADMIN_PASS}"
 
@@ -1207,7 +1209,9 @@ EOF_KRB
     ln -sf /etc/krb5.conf /var/lib/samba/private/krb5.conf
 
     if [ "$DNS_BACKEND" == "SAMBA_INTERNAL" ]; then
-        if ! grep -q "dns forwarder" /etc/samba/smb.conf; then
+        if grep -q "dns forwarder" /etc/samba/smb.conf; then
+            sed -i -E "s/^\s*dns forwarder\s*=.*/    dns forwarder = ${DNS_FORWARDER}/" /etc/samba/smb.conf
+        else
             sed -i "/\[global\]/a \    dns forwarder = ${DNS_FORWARDER}" /etc/samba/smb.conf
         fi
     else
@@ -1459,7 +1463,7 @@ module_remove_samba_ad() {
     systemctl restart chronyd 2>/dev/null || true
 
     log_step "[5/6] Dong cac port tuong lua Active Directory..."
-    for z in internal public; do
+    for z in internal external public; do
         firewall-cmd --zone=$z --permanent --remove-port={88,389,464}/tcp >/dev/null 2>&1 || true
         firewall-cmd --zone=$z --permanent --remove-port={88,389,464}/udp >/dev/null 2>&1 || true
         firewall-cmd --zone=$z --permanent --remove-port={135,636,3268,3269}/tcp >/dev/null 2>&1 || true
@@ -1650,7 +1654,7 @@ EOF_DOVECOT_LOCAL
 
     log_step "[Buoc 7/7] Mo port Firewalld va khoi chay dich vu..."
     if systemctl is-active --quiet firewalld; then
-        for z in internal public; do
+        for z in internal external public; do
             firewall-cmd --zone=$z --permanent --add-port={25,110,143,587,993,995}/tcp 2>/dev/null || true
             firewall-cmd --zone=$z --permanent --add-service={smtp,smtp-submission,imap,imaps,pop3,pop3s} >/dev/null 2>&1 || true
         done
@@ -2061,7 +2065,7 @@ EOF_NGINX_MAIL
 
     log_step "[Buoc 11/11] Mo port Firewalld tren ca 2 zone va khoi chay he thong..."
     if systemctl is-active --quiet firewalld; then
-        for z in internal public; do
+        for z in internal external public; do
             firewall-cmd --zone=$z --permanent --add-port={80,443,25,587,143,993,110,995}/tcp 2>/dev/null || true
         done
         firewall-cmd --reload 2>/dev/null || true
