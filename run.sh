@@ -12,6 +12,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+BOLD='\033[1m'
 NC='\033[0m'
 
 if [[ $EUID -ne 0 ]]; then
@@ -764,7 +765,189 @@ EOF_NGINX
 }
 
 # ==============================================================================
-# 8. CAU HINH NFS SERVER & CLIENT
+# 8. CAU HINH WEB SERVER (APACHE HTTPD & OPENSSL SSL)
+# ==============================================================================
+module_setup_apache() {
+    echo -e "\n${BLUE}======================================================================${NC}"
+    echo -e "${BLUE}   8. CAU HINH WEB SERVER APACHE (HTTPD) & OPENSSL SSL                ${NC}"
+    echo -e "${BLUE}======================================================================${NC}"
+    echo -e "Thiet lap may chu Web Apache HTTPD tren CentOS Stream 9:"
+    echo -e " - Giao thuc HTTP (Port 80) tu dong chuyen huong sang HTTPS"
+    echo -e " - Giao thuc HTTPS (Port 443) ma hoa bang chung chi SSL tu ky OpenSSL"
+    echo -e " - Cau hinh VirtualHost doc lap trong /etc/httpd/conf.d/"
+    echo -e " - Tu dong cau hinh Firewall va khoi dong dich vu httpd"
+    echo -e "----------------------------------------------------------------------"
+
+    if systemctl is-active --quiet nginx; then
+        echo ""
+        log_warn "Phat hien Nginx dang hoat dong tren he thong!"
+        echo -e "Apache HTTPD can su dung cong 80 va 443 de chay website."
+        read -rp "Ban co muon tam dung va tat Nginx de nhuong port cho Apache khong? (Y/n) [Y]: " STOP_NGINX
+        STOP_NGINX=${STOP_NGINX:-Y}
+        if [[ "$STOP_NGINX" =~ ^[Yy]$ ]]; then
+            log_step "Dang dung va vo hieu hoa Nginx..."
+            systemctl stop nginx 2>/dev/null || true
+            systemctl disable nginx 2>/dev/null || true
+            log_success "Da giai phong cong 80 va 443 cho Apache HTTPD!"
+        else
+            log_warn "Tiep tuc ma khong dung Nginx (httpd co the bao loi cong neu Nginx dang chiem giu)!"
+        fi
+    fi
+
+    log_step "[1/6] Cai dat httpd, mod_ssl, openssl, nano qua DNF..."
+    if ! dnf install -y httpd mod_ssl openssl nano; then
+        log_error "Cai dat cac goi Apache that bai!"
+        return 1
+    fi
+    log_success "Cai dat cac goi Apache thanh cong!"
+
+    if systemctl is-active --quiet firewalld; then
+        log_step "[2/6] Mo port HTTP (80) va HTTPS (443) tren Firewalld..."
+        for z in internal external public; do
+            firewall-cmd --zone=$z --add-service=http --permanent 2>/dev/null || true
+            firewall-cmd --zone=$z --add-service=https --permanent 2>/dev/null || true
+        done
+        firewall-cmd --reload 2>/dev/null || true
+        log_success "Da mo port 80/443 tren Firewalld!"
+    fi
+
+    echo ""
+    echo -e "${YELLOW}[3/6] THIET LAP TEN MIEN HOAC IP WEBSITE${NC}"
+    read -rp "  Nhap Domain hoac IP website [Mac dinh: nhom5.local]: " DOMAIN_IP
+    DOMAIN_IP=${DOMAIN_IP:-nhom5.local}
+    local WEB_ROOT="/var/www/$DOMAIN_IP"
+    mkdir -p "$WEB_ROOT"
+
+    log_step "[4/6] Khoi tao trang web mac dinh tai $WEB_ROOT/index.html..."
+    cat << EOF_HTML > "$WEB_ROOT/index.html"
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Website Apache - $DOMAIN_IP</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 40px; background: #f0f2f5; color: #333; }
+        .container { max-width: 650px; margin: auto; background: #fff; padding: 30px; border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+        h1 { color: #c0392b; margin-top: 0; }
+        .desc { font-size: 16px; line-height: 1.6; color: #555; }
+        .box { background: #f8f9fa; border-left: 4px solid #2980b9; padding: 15px; margin: 20px 0; border-radius: 4px; }
+        .box p { margin: 8px 0; }
+        .badge { display: inline-block; padding: 4px 10px; font-size: 13px; font-weight: bold; border-radius: 12px; background: #27ae60; color: #fff; }
+        .footer { text-align: center; margin-top: 25px; font-size: 13px; color: #888; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Chao mung den voi Apache HTTPD!</h1>
+        <p class="desc">Trang web da duoc khoi tao va hoat dong thanh cong tren he dieu hanh <strong>CentOS Stream 9</strong>.</p>
+        <div class="box">
+            <p><strong>Ten mien / Host:</strong> $DOMAIN_IP</p>
+            <p><strong>Web Server:</strong> Apache HTTP Server (httpd 2.4)</p>
+            <p><strong>Bao mat:</strong> <span class="badge">OpenSSL SSL / TLS (HTTPS)</span></p>
+            <p><strong>Thu muc goc:</strong> $WEB_ROOT</p>
+        </div>
+        <p class="desc">Moi truy cap qua cong HTTP (80) deu tu dong duoc chuyen huong an toan sang cong HTTPS (443).</p>
+        <div class="footer">&copy; Lab Quan Tri He Thong Mang - CentOS Stream 9</div>
+    </div>
+</body>
+</html>
+EOF_HTML
+
+    chown -R apache:apache "$WEB_ROOT"
+    chmod -R 755 "$WEB_ROOT"
+    chcon -R -t httpd_sys_content_t "$WEB_ROOT" 2>/dev/null || true
+    log_success "Da tao file index.html va phan quyen apache:apache!"
+
+    log_step "[5/6] Khoi tao chung chi SSL tu ky OpenSSL..."
+    mkdir -p /etc/httpd/ssl
+    local SSL_KEY="/etc/httpd/ssl/${DOMAIN_IP}.key"
+    local SSL_CRT="/etc/httpd/ssl/${DOMAIN_IP}.crt"
+
+    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout "$SSL_KEY" \
+        -out "$SSL_CRT" \
+        -subj "/C=VN/ST=HCM/L=HCM/O=Lab/CN=${DOMAIN_IP}" 2>/dev/null
+    chmod 600 "$SSL_KEY"
+    chmod 644 "$SSL_CRT"
+    log_success "Da tao SSL Certificate: $SSL_CRT"
+
+    local CONF_FILE="/etc/httpd/conf.d/${DOMAIN_IP}.conf"
+    log_step "[6/6] Ghi file VirtualHost $CONF_FILE va khoi dong dich vu..."
+
+    cat << 'EOF_APACHE' > "$CONF_FILE"
+<VirtualHost *:80>
+    ServerName __DOMAIN__
+    ServerAlias www.__DOMAIN__
+    DocumentRoot /var/www/__DOMAIN__
+
+    RewriteEngine On
+    RewriteCond %{HTTPS} off
+    RewriteRule ^(.*)$ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]
+
+    <Directory "/var/www/__DOMAIN__">
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    ErrorLog /var/log/httpd/__DOMAIN___error.log
+    CustomLog /var/log/httpd/__DOMAIN___access.log combined
+</VirtualHost>
+
+<VirtualHost *:443>
+    ServerName __DOMAIN__
+    ServerAlias www.__DOMAIN__
+    DocumentRoot /var/www/__DOMAIN__
+
+    SSLEngine on
+    SSLCertificateFile /etc/httpd/ssl/__DOMAIN__.crt
+    SSLCertificateKeyFile /etc/httpd/ssl/__DOMAIN__.key
+
+    <Directory "/var/www/__DOMAIN__">
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    ErrorLog /var/log/httpd/__DOMAIN___ssl_error.log
+    CustomLog /var/log/httpd/__DOMAIN___ssl_access.log combined
+</VirtualHost>
+EOF_APACHE
+    sed -i "s/__DOMAIN__/$DOMAIN_IP/g" "$CONF_FILE"
+
+    systemctl enable --now httpd >/dev/null 2>&1 || true
+
+    if apachectl configtest >/dev/null 2>&1; then
+        systemctl restart httpd
+        log_success "Cu phap Apache hop le, dich vu httpd da khoi dong thanh cong!"
+    else
+        log_warn "Phat hien canh bao khi kiem tra cu phap httpd:"
+        apachectl configtest 2>&1 || true
+        systemctl restart httpd || { log_error "Khoi dong httpd that bai!"; return 1; }
+    fi
+
+    echo ""
+    echo -e "${GREEN}==============================================================================${NC}"
+    echo -e "${GREEN}        CAI DAT VA CAU HINH APACHE HTTPD THANH CONG!                          ${NC}"
+    echo -e "${GREEN}==============================================================================${NC}"
+    echo -e "THONG TIN WEB SERVER APACHE:"
+    echo -e "  - Ten mien / IP       : ${CYAN}$DOMAIN_IP${NC}"
+    echo -e "  - File VirtualHost    : ${CYAN}$CONF_FILE${NC}"
+    echo -e "  - Thu muc DocumentRoot: ${CYAN}$WEB_ROOT${NC}"
+    echo -e "  - File SSL Cert/Key   : ${CYAN}$SSL_CRT${NC}"
+    echo -e "------------------------------------------------------------------------------"
+    echo -e "HUONG DAN KIEM TRA THUC TE:"
+    echo -e "1. Kiem tra HTTP tu dong chuyen huong sang HTTPS (Ma 301):"
+    echo -e "   curl -I http://$DOMAIN_IP"
+    echo -e "2. Kiem tra HTTPS nhan ket qua website (Ma 200 OK):"
+    echo -e "   curl -k -I https://$DOMAIN_IP"
+    echo -e "   curl -k https://$DOMAIN_IP"
+    echo -e "3. Kiem tra log truy cap va loi realtime:"
+    echo -e "   tail -f /var/log/httpd/${DOMAIN_IP}_access.log"
+    echo -e "${GREEN}==============================================================================${NC}\n"
+}
+
+# ==============================================================================
+# 9. CAU HINH NFS SERVER & CLIENT
 # ==============================================================================
 module_setup_nfs() {
     chon_card_mang_va_subnet_nfs() {
@@ -901,7 +1084,7 @@ module_setup_nfs() {
 }
 
 # ==============================================================================
-# 9. CAU HINH SAMBA FILE SHARING & TU DONG TAO MAY IN AO
+# 10. CAU HINH SAMBA FILE SHARING & TU DONG TAO MAY IN AO
 # ==============================================================================
 module_setup_samba() {
     echo -e "\n${BLUE}======================================================${NC}"
@@ -1047,7 +1230,7 @@ EOF_SMB_PRINTERS
 }
 
 # ==============================================================================
-# 10. CAU HINH SAMBA ACTIVE DIRECTORY DOMAIN CONTROLLER (AD DC)
+# 11. CAU HINH SAMBA ACTIVE DIRECTORY DOMAIN CONTROLLER (AD DC)
 # ==============================================================================
 module_setup_samba_ad() {
     echo -e "\n${CYAN}==================================================================${NC}"
@@ -1437,7 +1620,7 @@ EOF_AD_PRINTERS
 }
 
 # ==============================================================================
-# 11. XOA BO SAMBA ACTIVE DIRECTORY (GO BO AD DC)
+# 12. XOA BO SAMBA ACTIVE DIRECTORY (GO BO AD DC)
 # ==============================================================================
 module_remove_samba_ad() {
     echo -e "\n${RED}==================================================================${NC}"
@@ -1477,11 +1660,11 @@ module_remove_samba_ad() {
 }
 
 # ==============================================================================
-# 12. CAU HINH MAIL SERVER CO BAN (POSTFIX + DOVECOT - LOCAL USER)
+# 13. CAU HINH MAIL SERVER CO BAN (POSTFIX + DOVECOT - LOCAL USER)
 # ==============================================================================
 module_setup_mail_basic() {
     echo -e "\n${BLUE}================================================================${NC}"
-    echo -e "${BLUE}   12. CAU HINH MAIL SERVER LOCAL USER (POSTFIX + DOVECOT)      ${NC}"
+    echo -e "${BLUE}   13. CAU HINH MAIL SERVER LOCAL USER (POSTFIX + DOVECOT)      ${NC}"
     echo -e "${BLUE}================================================================${NC}"
 
     get_lan_topology_info
@@ -1681,11 +1864,11 @@ EOF_DOVECOT_LOCAL
 }
 
 # ==============================================================================
-# 13. CAU HINH ENTERPRISE WEBMAIL (PHP 8.3 APPSTREAM + ROUNDCUBE + POSTFIXADMIN)
+# 14. CAU HINH ENTERPRISE WEBMAIL (PHP 8.3 APPSTREAM + ROUNDCUBE + POSTFIXADMIN)
 # ==============================================================================
 module_setup_webmail_enterprise() {
     echo -e "\n${BLUE}====================================================================${NC}"
-    echo -e "${BLUE}   13. CAU HINH ENTERPRISE WEBMAIL (PHP 8.3 GOC + ROUNDCUBE)        ${NC}"
+    echo -e "${BLUE}   14. CAU HINH ENTERPRISE WEBMAIL (PHP 8.3 GOC + ROUNDCUBE)        ${NC}"
     echo -e "${BLUE}====================================================================${NC}"
 
     get_lan_topology_info
@@ -2096,6 +2279,283 @@ EOF_NGINX_MAIL
 }
 
 # ==============================================================================
+# 15. CAU HINH SQUID PROXY SERVER (CHAN WEBSITE & BASIC AUTHENTICATION)
+# ==============================================================================
+module_setup_squid() {
+    echo -e "\n${BLUE}======================================================================${NC}"
+    echo -e "${BLUE}   15. CAU HINH SQUID PROXY (CHAN WEB & AUTHENTICATION)               ${NC}"
+    echo -e "${BLUE}======================================================================${NC}"
+    echo -e "${YELLOW}Thiet lap he thong Squid Proxy tren CentOS Stream 9:${NC}"
+    echo -e " - Xac thuc nguoi dung (Basic Authentication - htpasswd)"
+    echo -e " - Danh sach ten mien bi chan (Blocked sites ACL)"
+    echo -e " - Cau hinh Firewalld & khoi dong dich vu tu dong"
+    echo -e "${CYAN}----------------------------------------------------------------------${NC}\n"
+
+    # [1/4] Thiet lap cong Proxy
+    echo -e "${BOLD}[1/4] THIET LAP CONG DICH VU (PORT)${NC}"
+    read -rp "  Nhap cong Proxy muon su dung [Mac dinh: 3128]: " PROXY_PORT
+    PROXY_PORT=${PROXY_PORT:-3128}
+    echo -e "  ${GREEN}✓ Cong Proxy: ${BOLD}${PROXY_PORT}${NC}\n"
+
+    # [2/4] Thiet lap tai khoan dang nhap
+    echo -e "${BOLD}[2/4] THIET LAP TAI KHOAN DANG NHAP PROXY${NC}"
+    read -rp "  Nhap ten tai khoan dau tien [Mac dinh: user1]: " USER1
+    USER1=${USER1:-user1}
+
+    read -rp "  Nhap mat khau cho tai khoan '$USER1' [Mac dinh: matkhau]: " PASS1
+    PASS1=${PASS1:-matkhau}
+
+    declare -a EXTRA_USERS=()
+    declare -a EXTRA_PASSES=()
+
+    while true; do
+        read -rp "  Ban co muon tao them tai khoan nguoi dung khac khong? (y/N) [N]: " ADD_MORE
+        ADD_MORE=${ADD_MORE:-N}
+        if [[ "$ADD_MORE" =~ ^[Yy]$ ]]; then
+            read -rp "    Nhap ten tai khoan tiep theo: " NEW_USER
+            if [ -z "$NEW_USER" ]; then
+                log_warn "Ten tai khoan khong duoc de trong!"
+                continue
+            fi
+            read -rp "    Nhap mat khau cho '$NEW_USER' [Mac dinh: matkhau]: " NEW_PASS
+            NEW_PASS=${NEW_PASS:-matkhau}
+            EXTRA_USERS+=("$NEW_USER")
+            EXTRA_PASSES+=("$NEW_PASS")
+            log_success "Da them: $NEW_USER"
+        else
+            break
+        fi
+    done
+    echo ""
+
+    # [3/4] Danh sach website can chan
+    echo -e "${BOLD}[3/4] DANH SACH WEBSITE CAN CHAN${NC}"
+    echo -e "  Danh sach mac dinh gom co:"
+    echo -e "    - ${RED}.facebook.com${NC}"
+    echo -e "    - ${RED}.tiktok.com${NC}"
+    echo -e "    - ${RED}.youtube.com${NC}"
+    echo -e "    - ${RED}.shopee.vn${NC}"
+    read -rp "  Nhap them cac ten mien muon chan (cach nhau bang dau cach, Enter de bo qua): " USER_SITES
+    echo ""
+
+    # [4/4] Thong tin may chu Proxy
+    echo -e "${BOLD}[4/4] THONG TIN MAY CHU PROXY${NC}"
+    local CURRENT_HOSTNAME
+    CURRENT_HOSTNAME=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "squid-proxy.local")
+    read -rp "  Nhap Hostname cho Proxy [Mac dinh: $CURRENT_HOSTNAME]: " PROXY_HOSTNAME
+    PROXY_HOSTNAME=${PROXY_HOSTNAME:-$CURRENT_HOSTNAME}
+
+    read -rp "  Nhap tieu de dang nhap (Realm) [Mac dinh: He thong Proxy - Vui long dang nhap]: " PROXY_REALM
+    PROXY_REALM=${PROXY_REALM:-"Hệ thống Proxy - Vui lòng đăng nhập để truy cập Internet"}
+    echo ""
+
+    # Tong hop va xac nhan
+    echo -e "${CYAN}----------------------------------------------------------------------${NC}"
+    echo -e "${BOLD}XAC NHAN THONG TIN CAU HINH:${NC}"
+    echo -e "  - Cong Squid Proxy : ${GREEN}${PROXY_PORT}${NC}"
+    echo -e "  - Tai khoan chinh  : ${GREEN}${USER1}${NC}"
+    if [ ${#EXTRA_USERS[@]} -gt 0 ]; then
+        echo -e "  - Tai khoan phu    : ${GREEN}${EXTRA_USERS[*]}${NC}"
+    fi
+    echo -e "  - Danh sach web cam: ${RED}.facebook.com, .tiktok.com, .youtube.com, .shopee.vn ${USER_SITES}${NC}"
+    echo -e "  - Hostname may chu : ${GREEN}${PROXY_HOSTNAME}${NC}"
+    echo -e "  - Tieu de dang nhap: ${GREEN}${PROXY_REALM}${NC}"
+    echo -e "${CYAN}----------------------------------------------------------------------${NC}"
+    read -rp "Bat dau cai dat ngay bay gio? (Y/n) [Y]: " CONFIRM
+    CONFIRM=${CONFIRM:-Y}
+    if [[ "$CONFIRM" =~ ^[Nn]$ ]]; then
+        log_warn "Da huy qua trinh cai dat."
+        return 0
+    fi
+
+    echo -e "\n${BOLD}${BLUE}=== BAT DAU CAI DAT VA CAU HINH SQUID PROXY ===${NC}\n"
+
+    # Buoc 1: Cai dat goi
+    log_step "[1/6] Dang cai dat Squid va httpd-tools qua DNF..."
+    if ! dnf install -y squid httpd-tools; then
+        log_error "Cai dat goi squid & httpd-tools that bai!"
+        return 1
+    fi
+    log_success "Cai dat goi squid & httpd-tools thanh cong!"
+
+    # Buoc 2: Tim module basic_ncsa_auth
+    log_step "[2/6] Kiem tra module xac thuc basic_ncsa_auth..."
+    local AUTH_HELPER=""
+    local CANDIDATE_PATHS=(
+        "/usr/lib64/squid/basic_ncsa_auth"
+        "/usr/libexec/squid/basic_ncsa_auth"
+        "/usr/lib/squid/basic_ncsa_auth"
+    )
+
+    for path in "${CANDIDATE_PATHS[@]}"; do
+        if [ -f "$path" ] && [ -x "$path" ]; then
+            AUTH_HELPER="$path"
+            break
+        fi
+    done
+
+    if [ -z "$AUTH_HELPER" ]; then
+        AUTH_HELPER=$(find /usr -name basic_ncsa_auth -type f -perm /111 2>/dev/null | head -n1)
+    fi
+
+    if [ -z "$AUTH_HELPER" ]; then
+        log_error "Khong tim thay chuong trinh basic_ncsa_auth tren he thong!"
+        return 1
+    fi
+    log_success "Da tim thay module auth: $AUTH_HELPER"
+
+    # Buoc 3: Tao file passwords
+    log_step "[3/6] Thiet lap file tai khoan /etc/squid/passwords..."
+    mkdir -p /etc/squid
+    htpasswd -b -c /etc/squid/passwords "$USER1" "$PASS1"
+    for i in "${!EXTRA_USERS[@]}"; do
+        htpasswd -b /etc/squid/passwords "${EXTRA_USERS[$i]}" "${EXTRA_PASSES[$i]}"
+    done
+    chown root:squid /etc/squid/passwords 2>/dev/null || true
+    chmod 640 /etc/squid/passwords
+    log_success "Da tao file passwords va phan quyen root:squid (chmod 640)!"
+
+    # Buoc 4: Danh sach chan
+    log_step "[4/6] Khoi tao danh sach chan /etc/squid/blocked_sites.acl..."
+    cat << 'EOF_BLOCKED' > /etc/squid/blocked_sites.acl
+.facebook.com
+.tiktok.com
+.youtube.com
+.shopee.vn
+EOF_BLOCKED
+
+    if [ -n "$USER_SITES" ]; then
+        for site in $USER_SITES; do
+            if [[ ! "$site" =~ ^\. ]]; then
+                site=".$site"
+            fi
+            echo "$site" >> /etc/squid/blocked_sites.acl
+        done
+    fi
+    log_success "Da tao file danh sach chan thanh cong!"
+
+    # Buoc 5: File squid.conf
+    log_step "[5/6] Cau hinh file /etc/squid/squid.conf..."
+    if [ -f /etc/squid/squid.conf ] && [ ! -f /etc/squid/squid.conf.orig ]; then
+        cp /etc/squid/squid.conf /etc/squid/squid.conf.orig
+        log_warn "Da sao luu file goc sang: /etc/squid/squid.conf.orig"
+    fi
+
+    cat << EOF_SQUID_CONF > /etc/squid/squid.conf
+# ==============================================================================
+# KHOI 1: CONG DICH VU (PORT)
+# ==============================================================================
+http_port ${PROXY_PORT}
+
+# ==============================================================================
+# KHOI 2: THIET LAP AUTHENTICATION (XAC THUC TAI KHOAN)
+# ==============================================================================
+auth_param basic program ${AUTH_HELPER} /etc/squid/passwords
+auth_param basic realm "${PROXY_REALM}"
+auth_param basic credentialsttl 2 hours
+
+# ==============================================================================
+# KHOI 3: KHAI BAO CAC ACL (ACCESS CONTROL LIST)
+# ==============================================================================
+# 1. ACL bat buoc phai xac thuc
+acl authenticated_users proxy_auth REQUIRED
+
+# 2. ACL danh sach cac trang web bi cam
+acl blocked_sites dstdomain "/etc/squid/blocked_sites.acl"
+
+# ==============================================================================
+# KHOI 4: LUAT HTTP_ACCESS (XU LY TUAN TU TU TREN XUONG DUOI)
+# ==============================================================================
+# Buoc 1: Kiem tra dang nhap
+# Neu chua co thong tin dang nhap hop le -> Yeu cau dang nhap (Tra ma 407)
+http_access deny !authenticated_users
+
+# Buoc 2: Kiem tra web cam
+# Nguoi dung da dang nhap roi, nhung neu vao web cam -> Chan dung (Tra ma 403)
+http_access deny blocked_sites
+
+# Buoc 3: Cho phep nguoi dung da dang nhap truy cap tat ca web con lai
+http_access allow authenticated_users
+
+# Buoc 4: Chan tat ca cac truong hop khac (Luat an toan mac dinh)
+http_access deny all
+
+# ==============================================================================
+# KHOI 5: THONG TIN MAY CHU
+# ==============================================================================
+visible_hostname ${PROXY_HOSTNAME}
+EOF_SQUID_CONF
+    log_success "Da tao file squid.conf chuan hoa!"
+
+    # Buoc 6: Firewall va khoi dong
+    log_step "[6/6] Cau hinh Firewall, kiem tra cu phap va khoi dong dich vu..."
+    if systemctl is-active --quiet firewalld; then
+        log_step "Dang mo cong ${PROXY_PORT}/tcp tren Firewall (Zone internal, external, public)..."
+        firewall-cmd --permanent --add-port=${PROXY_PORT}/tcp &>/dev/null || true
+        for z in internal external public; do
+            firewall-cmd --permanent --zone="$z" --add-port=${PROXY_PORT}/tcp &>/dev/null || true
+        done
+        firewall-cmd --reload &>/dev/null || true
+        log_success "Da mo cong ${PROXY_PORT}/tcp tren cac zone Firewalld!"
+    fi
+
+    log_step "Kiem tra cu phap cau hinh Squid..."
+    if ! squid -k parse &>/dev/null; then
+        log_error "Cu phap squid.conf bi loi! Chi tiet:"
+        squid -k parse
+        return 1
+    fi
+    log_success "Cu phap squid.conf chuan xac 100%!"
+
+    log_step "Khoi dong dich vu Squid..."
+    systemctl enable --now squid &>/dev/null || true
+    systemctl restart squid
+
+    if systemctl is-active --quiet squid; then
+        log_success "Dich vu Squid dang hoat dong: ACTIVE (RUNNING)!"
+    else
+        log_error "Khoi dong Squid that bai! Kiem tra: systemctl status squid"
+        return 1
+    fi
+
+    # Thong tin hoan tat
+    local SERVER_IPS PRIMARY_IP
+    SERVER_IPS=$(ip -4 addr show scope global 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1 | tr '\n' ' ')
+    PRIMARY_IP=$(echo "$SERVER_IPS" | awk '{print $1}')
+    PRIMARY_IP=${PRIMARY_IP:-127.0.0.1}
+
+    echo ""
+    echo -e "${GREEN}==============================================================================${NC}"
+    echo -e "${BOLD}${GREEN}        CAI DAT VA CAU HINH SQUID PROXY THANH CONG!                           ${NC}"
+    echo -e "${GREEN}==============================================================================${NC}"
+    echo -e "${BOLD}THONG TIN KET NOI PROXY:${NC}"
+    echo -e "  - Dia chi IP may chu : ${BOLD}${CYAN}${SERVER_IPS}${NC}"
+    echo -e "  - Cong Proxy (Port)   : ${BOLD}${CYAN}${PROXY_PORT}${NC}"
+    echo -e "  - Tai khoan kiem tra  : ${BOLD}${YELLOW}${USER1}${NC} | Mat khau: ${BOLD}${YELLOW}${PASS1}${NC}"
+    echo -e "${CYAN}------------------------------------------------------------------------------${NC}"
+    echo -e "${BOLD}HUONG DAN TEST THUC TE TREN CLIENT / MAY CHU:${NC}"
+    echo -e ""
+    echo -e "${CYAN}1. Test CHUA dang nhap (Tra ma 407 Proxy Authentication Required):${NC}"
+    echo -e "   curl -x http://${PRIMARY_IP}:${PROXY_PORT} -I http://google.com"
+    echo -e ""
+    echo -e "${CYAN}2. Test DA dang nhap vao trang hop le (Tra ve 200 / 301 / 302):${NC}"
+    echo -e "   curl -x http://${USER1}:${PASS1}@${PRIMARY_IP}:${PROXY_PORT} -I https://google.com"
+    echo -e ""
+    echo -e "${CYAN}3. Test DA dang nhap vao trang BI CAM (Tra ve 403 Forbidden):${NC}"
+    echo -e "   curl -x http://${USER1}:${PASS1}@${PRIMARY_IP}:${PROXY_PORT} -I https://facebook.com"
+    echo -e "   curl -x http://${USER1}:${PASS1}@${PRIMARY_IP}:${PROXY_PORT} -I https://tiktok.com"
+    echo -e ""
+    echo -e "${CYAN}4. Cau hinh tren trinh duyet Windows 10/11:${NC}"
+    echo -e "   - Vao Settings -> Network & Internet -> Proxy -> Manual proxy setup"
+    echo -e "   - Bat Use a proxy server -> ON"
+    echo -e "   - Address: ${PRIMARY_IP}  |  Port: ${PROXY_PORT}"
+    echo -e ""
+    echo -e "${CYAN}5. Theo doi log truy cap realtime tren may chu:${NC}"
+    echo -e "   tail -f /var/log/squid/access.log"
+    echo -e "${GREEN}==============================================================================${NC}\n"
+}
+
+# ==============================================================================
 # MENU CHINH
 # ==============================================================================
 while true; do
@@ -2110,15 +2570,17 @@ while true; do
     echo -e "  ${YELLOW}5)${NC} Cau hinh DHCP (ISC DHCP Server)"
     echo -e "  ${YELLOW}6)${NC} Cau hinh FTP (vsftpd Server)"
     echo -e "  ${YELLOW}7)${NC} Cau hinh Web Server (Nginx & OpenSSL)"
-    echo -e "  ${YELLOW}8)${NC} Cau hinh NFS (Server / Client)"
-    echo -e "  ${YELLOW}9)${NC} Cau hinh Samba (Samba File Sharing & CUPS Printer)"
-    echo -e "  ${YELLOW}10)${NC} Cau hinh Samba AD DC (OU, User, Share, CUPS Printer)"
-    echo -e "  ${YELLOW}11)${NC} Xoa bo Samba Active Directory (Go bo AD DC)"
-    echo -e "  ${YELLOW}12)${NC} Cau hinh Mail Server Local User (Postfix + Dovecot)"
-    echo -e "  ${YELLOW}13)${NC} Cau hinh Enterprise Webmail (PHP 8.3 AppStream + Roundcube)"
+    echo -e "  ${YELLOW}8)${NC} Cau hinh Web Server (Apache HTTPD & OpenSSL)"
+    echo -e "  ${YELLOW}9)${NC} Cau hinh NFS (Server / Client)"
+    echo -e "  ${YELLOW}10)${NC} Cau hinh Samba (Samba File Sharing & CUPS Printer)"
+    echo -e "  ${YELLOW}11)${NC} Cau hinh Samba AD DC (OU, User, Share, CUPS Printer)"
+    echo -e "  ${YELLOW}12)${NC} Xoa bo Samba Active Directory (Go bo AD DC)"
+    echo -e "  ${YELLOW}13)${NC} Cau hinh Mail Server Local User (Postfix + Dovecot)"
+    echo -e "  ${YELLOW}14)${NC} Cau hinh Enterprise Webmail (PHP 8.3 AppStream + Roundcube)"
+    echo -e "  ${YELLOW}15)${NC} Cau hinh Squid Proxy (Chan Web & Xac thuc Basic Auth)"
     echo -e "  ${YELLOW}0)${NC} Thoat"
     echo -e "${CYAN}----------------------------------------------------------------${NC}"
-    read -rp "Nhap lua chon cua ban [0-13]: " MAIN_CHOICE
+    read -rp "Nhap lua chon cua ban [0-15]: " MAIN_CHOICE
 
     case "$MAIN_CHOICE" in
         1) module_disable_selinux; pause_menu ;;
@@ -2128,12 +2590,14 @@ while true; do
         5) module_setup_dhcp; pause_menu ;;
         6) module_setup_ftp; pause_menu ;;
         7) module_setup_web; pause_menu ;;
-        8) module_setup_nfs ;;
-        9) module_setup_samba; pause_menu ;;
-        10) module_setup_samba_ad; pause_menu ;;
-        11) module_remove_samba_ad; pause_menu ;;
-        12) module_setup_mail_basic; pause_menu ;;
-        13) module_setup_webmail_enterprise; pause_menu ;;
+        8) module_setup_apache; pause_menu ;;
+        9) module_setup_nfs ;;
+        10) module_setup_samba; pause_menu ;;
+        11) module_setup_samba_ad; pause_menu ;;
+        12) module_remove_samba_ad; pause_menu ;;
+        13) module_setup_mail_basic; pause_menu ;;
+        14) module_setup_webmail_enterprise; pause_menu ;;
+        15) module_setup_squid; pause_menu ;;
         0) echo -e "${GREEN}Tam biet!${NC}"; exit 0 ;;
         *) log_error "Lua chon khong hop le." ;;
     esac
